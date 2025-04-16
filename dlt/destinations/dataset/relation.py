@@ -29,6 +29,7 @@ class BaseReadableDBAPIRelation(SupportsReadableRelation, WithSqlClient):
         """Create a lazy evaluated relation to for the dataset of a destination"""
 
         self._dataset = readable_dataset
+        self._table_name = None
 
         # wire protocol functions
         self.df = self._wrap_func("df")  # type: ignore
@@ -66,7 +67,7 @@ class BaseReadableDBAPIRelation(SupportsReadableRelation, WithSqlClient):
             if hasattr(self.sql_client, "_conn") and hasattr(self.sql_client._conn, "autocommit"):
                 self.sql_client._conn.autocommit = False
             with client.execute_query(self.query()) as cursor:
-                if columns_schema := self.columns_schema:
+                if columns_schema := self.compute_columns_schema():
                     cursor.columns_schema = columns_schema
                 yield cursor
 
@@ -92,7 +93,9 @@ class BaseReadableDBAPIRelation(SupportsReadableRelation, WithSqlClient):
         """provide schema columns for the cursor, may be filtered by selected columns"""
 
         # NOTE: if we do not have a schema, we cannot compute the columns schema
-        if self._dataset.schema is None:
+        if self._dataset.schema is None or (
+            self._table_name and self._table_name not in self._dataset.schema.tables.keys()
+        ):
             return {}
 
         # TODO: sqlalchemy is not supported at this point
@@ -136,7 +139,7 @@ class ReadableDBAPIRelation(BaseReadableDBAPIRelation):
         super().__init__(readable_dataset=readable_dataset)
 
         self._provided_query = provided_query
-        self._table_name = table_name
+        self._table_name = table_name  # type: ignore
         self._limit = limit
         self._selected_columns = selected_columns
 
@@ -193,8 +196,6 @@ class ReadableDBAPIRelation(BaseReadableDBAPIRelation):
             raise ReadableRelationHasQueryException("select")
         rel = self.__copy__()
         rel._selected_columns = columns
-        # NOTE: the line below will ensure that no unknown columns are selected if
-        # schema is known
         rel.compute_columns_schema()
         return rel
 
