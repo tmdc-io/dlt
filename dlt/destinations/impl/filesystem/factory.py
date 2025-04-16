@@ -54,6 +54,10 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
         caps.supported_replace_strategies = ["truncate-and-insert"]
         caps.sqlglot_dialect = "duckdb"
 
+        from dlt.destinations.impl.duckdb.factory import DuckDbTypeMapper
+
+        caps.type_mapper = DuckDbTypeMapper
+
         return caps
 
     @property
