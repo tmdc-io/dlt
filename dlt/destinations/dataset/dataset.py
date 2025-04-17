@@ -14,7 +14,7 @@ from dlt.common.destination.typing import TDatasetType
 from dlt.common.schema import Schema
 
 from dlt.destinations.sql_client import SqlClientBase, WithSqlClient
-from dlt.destinations.dataset.relation import ReadableDBAPIRelation
+from dlt.destinations.dataset.relation import ReadableDBAPIRelation, BaseReadableDBAPIRelation
 from dlt.destinations.dataset.utils import get_destination_clients
 
 if TYPE_CHECKING:
@@ -151,22 +151,25 @@ class ReadableDBAPIDataset(SupportsReadableDataset[TReadableRelation]):
 
     def table(self, table_name: str) -> TReadableRelation:
         # we can create an ibis powered relation if ibis is available
+        relation: BaseReadableDBAPIRelation
         if self._dataset_type == "ibis":
             from dlt.helpers.ibis import create_unbound_ibis_table
             from dlt.destinations.dataset.ibis_relation import ReadableIbisRelation
 
             unbound_table = create_unbound_ibis_table(self.sql_client, self.schema, table_name)
-            return ReadableIbisRelation(  # type: ignore[abstract,return-value]
+            relation = ReadableIbisRelation(  # type: ignore[abstract]
                 readable_dataset=self,
                 ibis_object=unbound_table,
-                columns_schema=self.schema.tables[table_name]["columns"],
             )
 
-        # fallback to the standard dbapi relation
-        return ReadableDBAPIRelation(  # type: ignore[abstract,return-value]
-            readable_dataset=self,
-            table_name=table_name,
-        )
+        else:
+            # fallback to the standard dbapi relation
+            relation = ReadableDBAPIRelation(  # type: ignore[abstract]
+                readable_dataset=self,
+                table_name=table_name,
+            )
+
+        return relation  # type: ignore[return-value]
 
     def row_counts(
         self, *, data_tables: bool = True, dlt_tables: bool = False, table_names: List[str] = None
