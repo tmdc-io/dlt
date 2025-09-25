@@ -1,6 +1,6 @@
 from typing import Any, Dict, Type, Union, TYPE_CHECKING, Optional
 
-from dlt.common.data_writers.configuration import CsvFormatConfiguration
+from dlt.common.destination.configuration import CsvFormatConfiguration
 from dlt.common.destination import Destination, DestinationCapabilitiesContext
 from dlt.common.data_writers.escape import escape_snowflake_identifier
 from dlt.common.arithmetics import DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE
@@ -73,20 +73,21 @@ class SnowflakeTypeMapper(TypeMapperImpl):
         precision = column.get("precision")
 
         if timezone and precision is None:
+            # use lookup table for non-precision types
             return None
 
         timestamp = "TIMESTAMP_TZ" if timezone else "TIMESTAMP_NTZ"
 
         # append precision if specified and valid
         if precision is not None:
-            if 0 <= precision <= 9:
+            if 0 <= precision <= self.capabilities.max_timestamp_precision:
                 timestamp += f"({precision})"
             else:
                 column_name = column["name"]
                 table_name = table["name"]
                 raise TerminalValueError(
-                    f"Snowflake does not support precision '{precision}' for '{column_name}' in"
-                    f" table '{table_name}'"
+                    f"Snowflake does not support `{precision=:}` for timestamp column"
+                    f" `{column_name}` in table `{table_name}`"
                 )
 
         return timestamp
@@ -126,6 +127,8 @@ class snowflake(Destination[SnowflakeClientConfiguration, "SnowflakeClient"]):
             "insert-from-staging",
             "staging-optimized",
         ]
+        caps.timestamp_precision = 6
+        caps.max_timestamp_precision = 9
         caps.sqlglot_dialect = "snowflake"
 
         return caps

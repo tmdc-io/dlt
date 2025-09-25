@@ -6,9 +6,11 @@ import pytest
 import pyarrow as pa
 
 from dlt.common import pendulum
+from dlt.common.destination.capabilities import adjust_schema_to_capabilities
 from dlt.common.libs.pyarrow import (
     columns_to_arrow,
     deserialize_type,
+    fill_empty_source_column_values_with_placeholder,
     get_column_type_from_py_arrow,
     py_arrow_to_table_schema_columns,
     from_arrow_scalar,
@@ -21,14 +23,15 @@ from dlt.common.libs.pyarrow import (
     append_column,
     rename_columns,
     is_arrow_item,
+    remove_null_columns_from_schema,
     UnsupportedArrowTypeException,
 )
 from dlt.common.destination import DestinationCapabilitiesContext
-from tests.cases import TABLE_UPDATE_COLUMNS_SCHEMA
+from tests.cases import table_update_and_row
 
 
 def test_py_arrow_to_table_schema_columns():
-    dlt_schema = deepcopy(TABLE_UPDATE_COLUMNS_SCHEMA)
+    dlt_schema, _ = table_update_and_row()
 
     caps = DestinationCapabilitiesContext.generic_capabilities()
     # The arrow schema will add precision
@@ -38,6 +41,7 @@ def test_py_arrow_to_table_schema_columns():
     dlt_schema["col4_null"]["precision"] = caps.timestamp_precision
     dlt_schema["col6_null"]["precision"], dlt_schema["col6_null"]["scale"] = caps.decimal_precision
     dlt_schema["col11_null"]["precision"] = caps.timestamp_precision
+    dlt_schema["col12"]["precision"] = caps.timestamp_precision
 
     # Ignoring wei as we can't distinguish from decimal
     dlt_schema["col8"]["precision"], dlt_schema["col8"]["scale"] = (76, 0)
@@ -65,7 +69,7 @@ def test_py_arrow_to_table_schema_columns():
         ]
     )
 
-    result = py_arrow_to_table_schema_columns(arrow_schema, caps)
+    result = py_arrow_to_table_schema_columns(arrow_schema)
 
     # Resulting schema should match the original
     assert result == dlt_schema
@@ -115,7 +119,8 @@ def test_py_arrow_to_table_schema_columns_nested_types(supports_nested_types: bo
     )
 
     # Convert to table schema columns
-    columns = py_arrow_to_table_schema_columns(schema, caps)
+    columns = py_arrow_to_table_schema_columns(schema)
+    adjust_schema_to_capabilities(columns, caps)
 
     # Verify all columns are correctly identified as JSON data type
     for _, column in columns.items():
@@ -175,7 +180,7 @@ def test_nested_type_serialization_deserialization():
 
     # Test with table schema conversion
     schema = pa.schema([pa.field("nested_column", nested_type)])
-    columns = py_arrow_to_table_schema_columns(schema, caps)
+    columns = py_arrow_to_table_schema_columns(schema)
 
     # Verify the column is marked as JSON and has the serialized type
     assert columns["nested_column"]["data_type"] == "json"
@@ -214,7 +219,7 @@ def test_py_arrow_to_table_schema_columns_dict_in_struct():
     )
 
     # Convert to table schema columns
-    columns = py_arrow_to_table_schema_columns(arrow_schema, caps)
+    columns = py_arrow_to_table_schema_columns(arrow_schema)
 
     # Struct with dict should be converted to json type with nested-type info
     assert columns["struct_with_dict"]["data_type"] == "json"
@@ -250,7 +255,7 @@ def test_py_arrow_to_table_schema_columns_nested_dict_types():
     )
 
     # Convert to table schema columns
-    columns = py_arrow_to_table_schema_columns(arrow_schema, caps)
+    columns = py_arrow_to_table_schema_columns(arrow_schema)
 
     # Dict of lists and dict of structs should be converted to the value types
     assert columns["dict_of_lists"]["data_type"] == "json"
@@ -287,9 +292,7 @@ def test_py_arrow_dict_to_column() -> None:
     array_1 = pa.array(["a", "b", "c"], type=pa.dictionary(pa.int8(), pa.string()))
     array_2 = pa.array([1, 2, 3], type=pa.dictionary(pa.int8(), pa.int64()))
     table = pa.table({"strings": array_1, "ints": array_2})
-    columns = py_arrow_to_table_schema_columns(
-        table.schema, DestinationCapabilitiesContext.generic_capabilities()
-    )
+    columns = py_arrow_to_table_schema_columns(table.schema)
     assert columns == {
         "strings": {"name": "strings", "nullable": True, "data_type": "text"},
         "ints": {"name": "ints", "nullable": True, "data_type": "bigint"},
@@ -353,7 +356,7 @@ def test_exception_for_unsupported_arrow_type() -> None:
     obj = pa.duration("s")
     # error on type conversion
     with pytest.raises(UnsupportedArrowTypeException):
-        get_column_type_from_py_arrow(obj, DestinationCapabilitiesContext.generic_capabilities())
+        get_column_type_from_py_arrow(obj)
 
 
 def test_exception_for_schema_with_unsupported_arrow_type() -> None:
@@ -366,9 +369,7 @@ def test_exception_for_schema_with_unsupported_arrow_type() -> None:
 
     # assert the exception is raised
     with pytest.raises(UnsupportedArrowTypeException) as excinfo:
-        py_arrow_to_table_schema_columns(
-            table.schema, DestinationCapabilitiesContext.generic_capabilities()
-        )
+        py_arrow_to_table_schema_columns(table.schema)
 
     (msg,) = excinfo.value.args
     assert "duration" in msg
@@ -446,3 +447,49 @@ def test_is_arrow_item(pa_type: Any) -> None:
     assert is_arrow_item(table)
     assert not is_arrow_item(table.to_pydict())
     assert not is_arrow_item("hello")
+
+
+def test_null_arrow_type() -> None:
+    obj = pa.null()
+    column_type = get_column_type_from_py_arrow(obj)
+    assert {"seen-null-first": True} == column_type["x-normalizer"]  # type: ignore[typeddict-item]
+
+
+def test_remove_null_columns_from_schema() -> None:
+    schema = pa.schema(
+        [
+            pa.field("col1", pa.int32()),
+            pa.field("col2", pa.null()),
+            pa.field("col3", pa.string()),
+            pa.field("col4", pa.null()),
+        ]
+    )
+
+    new_schema, contains_null = remove_null_columns_from_schema(schema)
+    assert contains_null is True
+    assert new_schema.names == ["col1", "col3"]
+    assert all(not pa.types.is_null(f.type) for f in new_schema)
+
+
+def test_fill_empty_source_column_values_with_placeholder() -> None:
+    data = [
+        pa.array(["", "hello", ""]),
+        pa.array(["hello", None, ""]),
+        pa.array([1, 2, 3]),
+        pa.array(["world", "", "arrow"]),
+    ]
+    table = pa.Table.from_arrays(data, names=["A", "B", "C", "D"])
+
+    source_columns = ["A", "B"]
+    placeholder = "placeholder"
+
+    new_table = fill_empty_source_column_values_with_placeholder(table, source_columns, placeholder)
+
+    expected_data = [
+        pa.array(["placeholder", "hello", "placeholder"]),
+        pa.array(["hello", "placeholder", "placeholder"]),
+        pa.array([1, 2, 3]),
+        pa.array(["world", "", "arrow"]),
+    ]
+    expected_table = pa.Table.from_arrays(expected_data, names=["A", "B", "C", "D"])
+    assert new_table.equals(expected_table)

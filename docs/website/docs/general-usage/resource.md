@@ -227,14 +227,14 @@ You can add arguments to your resource functions like to any other. Below we par
 
 ```py
 @dlt.resource(name='table_name', write_disposition='replace')
-def generate_rows(nr):
+def generate_var_rows(nr):
     for i in range(nr):
         yield {'id': i, 'example_string': 'abc'}
 
-for row in generate_rows(10):
+for row in generate_var_rows(10):
     print(row)
 
-for row in generate_rows(20):
+for row in generate_var_rows(20):
     print(row)
 ```
 
@@ -292,9 +292,9 @@ print(list([1,2] | pokemon()))
 :::
 
 ### Declare a standalone resource
-A standalone resource is defined on a function that is top-level in a module (not an inner function) that accepts config and secrets values. Additionally, if the `standalone` flag is specified, the decorated function signature and docstring will be preserved. `dlt.resource` will just wrap the decorated function, and the user must call the wrapper to get the actual resource. Below we declare a `filesystem` resource that must be called before use.
+A standalone resource is defined on a function that is top-level in a module (not an inner function) that accepts config and secrets values. Here `dlt.resource` just wraps the decorated function, and the user must call the wrapper to get the actual resource. Below we declare a `filesystem` resource that must be called before use.
 ```py
-@dlt.resource(standalone=True)
+@dlt.resource
 def fs_resource(bucket_url=dlt.config.value):
   """List and yield files in `bucket_url`."""
   ...
@@ -303,9 +303,9 @@ def fs_resource(bucket_url=dlt.config.value):
 pipeline.run(fs_resource("s3://my-bucket/reports"), table_name="reports")
 ```
 
-Standalone may have a dynamic name that depends on the arguments passed to the decorated function. For example:
+Resource may have a dynamic name that depends on the arguments passed to the decorated function. For example:
 ```py
-@dlt.resource(standalone=True, name=lambda args: args["stream_name"])
+@dlt.resource(name=lambda args: args["stream_name"])
 def kinesis(stream_name: str):
     ...
 
@@ -350,9 +350,9 @@ Please find more details in [extract performance](../reference/performance.md#ex
 You can attach any number of transformations that are evaluated on an item-per-item basis to your
 resource. The available transformation types:
 
-- **map** - transform the data item (`resource.add_map`).
+- [**map**](../dlt-ecosystem/transformations/add-map#add_map) - transform the data item (`resource.add_map`).
 - **filter** - filter the data item (`resource.add_filter`).
-- **yield map** - a map that returns an iterator (so a single row may generate many rows -
+- [**yield map**](../dlt-ecosystem/transformations/add-map#add_yield_map) - a map that returns an iterator (so a single row may generate many rows -
   `resource.add_yield_map`).
 
 Example: We have a resource that loads a list of users from an API endpoint. We want to customize it
@@ -548,6 +548,71 @@ In the example above, we use `dlt.mark.with_hints` and `dlt.mark.make_hints` to 
 You can emit columns as a Pydantic model and use dynamic hints (i.e., lambda for table name) as well. You should avoid redefining `Incremental` this way.
 :::
 
+### Materialize schema without loading data
+
+Sometimes you need a table to exist with no rows. Examples:
+
+- Prepare empty tables for downstream jobs.
+- [Publish a schema](../walkthroughs/adjust-a-schema) before data arrives.
+- Ensure tables exist even when an upstream returns zero records.
+
+dlt’s default behavior is that it creates tables only when a resource yields data. If no rows are yieled, the table is not created.
+
+#### Options for schema materialization
+
+At the resource level, there are two ways to materialize an empty schema in the destination.
+
+#### Provide schema explicitly
+To create an empty table, declare the schema explicitly in one of two ways:
+
+- in the resource function with `@dlt.resource`, or
+- by applying hints with `apply_hints`.
+
+You can also [adjust schemas manually](../walkthroughs/adjust-a-schema) using import/export folders.
+
+Declaring the schema ensures dlt updates the schema even when no data is present.
+
+Then define the resource function and yield an empty dict (`{}`). dlt creates an empty table with all declared columns. Only the metadata columns `_dlt_id` and `_dlt_load_id` will have values.
+
+:::note
+The load will fail if the schema marks any columns as `NOT NULL` i.e. `"nullable": False`. Ensure all non-metadata columns are nullable when loading an empty table.
+:::
+
+Example: 
+```py
+@dlt.resource(
+    table_name="your_table_name",
+    columns={
+        "id": {"data_type": "bigint", "nullable": True},
+        "event_type": {"data_type": "text", "nullable": True}
+    },
+    write_disposition="replace"
+)
+def raw_events():
+    yield {}
+```
+
+#### Materialize schema without rows
+
+Use `dlt.mark.materialize_table_schema()` together with `dlt.mark.with_hints()` to define a schema without inserting rows.
+
+Unlike the explicit schema method, this works even if the schema contains non-nullable columns, since no data is written.
+
+Example:
+```py
+@dlt.resource(table_name="raw_events")
+def raw_events():
+    yield dlt.mark.with_hints(
+        dlt.mark.materialize_table_schema(),  # create schema only (no rows)
+        dlt.mark.make_hints(columns=[
+            {"name": "id", "data_type": "bigint", "primary_key": True, "nullable": False},  # PK ⇒ non-nullable
+            {"name": "event_type", "data_type": "text", "nullable": True},
+        ])
+    )
+```
+Result: 
+Table `raw_events` is created with the defined schema and no rows.
+
 ### Import external files
 You can import external files, i.e., CSV, Parquet, and JSONL, by yielding items marked with `with_file_import`, optionally passing a table schema corresponding to the imported file. dlt will not read, parse, or normalize any names (i.e., CSV or Arrow headers) and will attempt to copy the file into the destination as is.
 ```py
@@ -605,7 +670,7 @@ You can sniff the schema from the data, i.e., using DuckDB to infer the table sc
 There are cases when your resources are generic (i.e., bucket filesystem) and you want to load several instances of it (i.e., files from different folders) into separate tables. In the example below, we use the `filesystem` source to load csvs from two different folders into separate tables:
 
 ```py
-@dlt.resource(standalone=True)
+@dlt.resource
 def fs_resource(bucket_url):
   # list and yield files in bucket_url
   ...
@@ -634,7 +699,7 @@ You can pass individual resources or a list of resources to the `dlt.pipeline` o
 
 ```py
 @dlt.resource(name='table_name', write_disposition='replace')
-def generate_rows(nr):
+def generate_var_rows(nr):
     for i in range(nr):
         yield {'id': i, 'example_string': 'abc'}
 
@@ -644,9 +709,9 @@ pipeline = dlt.pipeline(
     dataset_name="rows_data"
 )
 # load an individual resource
-pipeline.run(generate_rows(10))
+pipeline.run(generate_var_rows(10))
 # load a list of resources
-pipeline.run([generate_rows(10), generate_rows(20)])
+pipeline.run([generate_var_rows(10), generate_var_rows(20)])
 ```
 
 ### Pick loader file format for a particular resource
@@ -655,7 +720,7 @@ You can request a particular loader file format to be used for a resource.
 
 ```py
 @dlt.resource(file_format="parquet")
-def generate_rows(nr):
+def generate_var_rows(nr):
     for i in range(nr):
         yield {'id': i, 'example_string': 'abc'}
 ```

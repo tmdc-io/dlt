@@ -9,18 +9,16 @@ from dlt.common.utils import uniq_id
 from dlt.destinations.exceptions import DatabaseUndefinedRelation
 from dlt.load.exceptions import LoadClientJobFailed
 from dlt.pipeline.exceptions import PipelineStepFailed
+from tests.load.pipeline.utils import simple_nested_pipeline
 from tests.load.snowflake.test_snowflake_client import QUERY_TAG
 
-from tests.load.pipeline.test_pipelines import simple_nested_pipeline
-from tests.pipeline.utils import assert_load_info, assert_query_data
+from tests.pipeline.utils import assert_load_info, assert_query_column
 from tests.load.utils import (
-    TABLE_UPDATE_COLUMNS_SCHEMA,
     assert_all_data_types_row,
     destinations_configs,
     DestinationTestConfiguration,
-    drop_active_pipeline_data,
 )
-from tests.cases import TABLE_ROW_ALL_DATA_TYPES_DATETIMES
+from tests.cases import TABLE_ROW_ALL_DATA_TYPES_DATETIMES, table_update_and_row
 
 
 # mark all tests as essential, do not remove
@@ -110,8 +108,6 @@ def test_snowflake_custom_stage(destination_config: DestinationTestConfiguration
     assert isinstance(f_jobs.value.__cause__, LoadClientJobFailed)
     assert "MY_NON_EXISTING_STAGE" in f_jobs.value.__cause__.failed_message
 
-    drop_active_pipeline_data()
-
     # NOTE: this stage must be created in DLT_DATA database for this test to pass!
     # CREATE STAGE MY_CUSTOM_LOCAL_STAGE;
     # GRANT READ, WRITE ON STAGE DLT_DATA.PUBLIC.MY_CUSTOM_LOCAL_STAGE TO ROLE DLT_LOADER_ROLE;
@@ -129,7 +125,7 @@ def test_snowflake_custom_stage(destination_config: DestinationTestConfiguration
         assert len(staged_files) == 3
         # check data of one table to ensure copy was done successfully
         tbl_name = client.make_qualified_table_name("lists")
-        assert_query_data(pipeline, f"SELECT value FROM {tbl_name}", ["a", None, None])
+        assert_query_column(pipeline, f"SELECT value FROM {tbl_name}", ["a", None, None])
 
 
 # do not remove - it allows us to filter tests by destination
@@ -159,7 +155,7 @@ def test_snowflake_delete_file_after_copy(destination_config: DestinationTestCon
 
         # ensure copy was done
         tbl_name = client.make_qualified_table_name("lists")
-        assert_query_data(pipeline, f"SELECT value FROM {tbl_name}", ["a", None, None])
+        assert_query_column(pipeline, f"SELECT value FROM {tbl_name}", ["a", None, None])
 
 
 from dlt.common.normalizers.naming.sql_cs_v1 import NamingConvention as SqlCsV1NamingConvention
@@ -207,7 +203,7 @@ def test_char_replacement_cs_naming_convention(
     rel_ = pipeline.dataset()["AMLPerFornyelseoe"]
     results = rel_.fetchall()
     assert len(results) == 1
-    assert "AmlSistUtfoertDato" in rel_.columns_schema
+    assert "AmlSistUtfoertDato" in rel_.columns
 
 
 @pytest.mark.parametrize(
@@ -236,10 +232,10 @@ def test_snowflake_use_vectorized_scanner(
     load_job_spy = mocker.spy(snowflake, "gen_copy_sql")
 
     data_types = deepcopy(TABLE_ROW_ALL_DATA_TYPES_DATETIMES)
-    column_schemas = deepcopy(TABLE_UPDATE_COLUMNS_SCHEMA)
+    columns_schema, _ = table_update_and_row()
     expected_rows = deepcopy(TABLE_ROW_ALL_DATA_TYPES_DATETIMES)
 
-    @dlt.resource(table_name="data_types", write_disposition="merge", columns=column_schemas)
+    @dlt.resource(table_name="data_types", write_disposition="merge", columns=columns_schema)
     def my_resource():
         nonlocal data_types
         yield [data_types] * 10
@@ -311,9 +307,127 @@ def test_snowflake_use_vectorized_scanner(
         db_row = list(db_rows[0])
         # "snowflake" does not parse JSON from parquet string so double parse
         assert_all_data_types_row(
+            sql_client.capabilities,
             db_row,
             expected_row=expected_rows,
-            schema=column_schemas,
+            schema=columns_schema,
             parse_json_strings=True,
-            timestamp_precision=6,
         )
+
+
+@pytest.mark.skip(reason="perf test for merge")
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        default_sql_configs=True,
+        subset=["snowflake"],
+    ),
+    ids=lambda x: x.name,
+)
+def test_snowflake_merge_time(destination_config):
+    import pyarrow as pa
+    import numpy as np
+    import time
+    from datetime import date, timedelta
+
+    # create a unique dataset name for this test
+    dataset_name = f"merge_performance_{uniq_id()}"
+    pipeline = destination_config.setup_pipeline(
+        "test_snowflake_merge_time", dataset_name=dataset_name
+    )
+
+    # define the number of rows and date range
+    num_rows = 1_000_000
+    base_date = date(2023, 1, 1)
+    days = 5
+
+    # generate data for 5 different days
+    all_data = []
+
+    # create column data
+    user_ids = np.random.randint(1, 10000, num_rows)
+    product_ids = np.random.randint(1, 1000, num_rows)
+    values = np.random.random(num_rows) * 1000
+
+    # create data for each day
+    for day_offset in range(days):
+        current_date = base_date + timedelta(days=day_offset)
+        dates = np.array([current_date] * num_rows)
+
+        table = pa.Table.from_arrays(
+            [pa.array(user_ids), pa.array(product_ids), pa.array(dates), pa.array(values)],
+            names=["user_id", "product_id", "event_date", "value"],
+        )
+        all_data.append(table)
+
+    combined_table = pa.concat_tables(all_data)
+
+    @dlt.resource(
+        table_name="merge_test",
+        primary_key=["user_id", "product_id"],
+        merge_key="event_date",
+        write_disposition="merge",
+    )
+    def initial_data():
+        yield combined_table
+
+    # Load initial data
+    print(f"Loading {len(combined_table)} rows of initial data...")
+    start_time = time.time()
+    info = pipeline.run(initial_data(), **destination_config.run_kwargs)
+    initial_load_time = time.time() - start_time
+    print(f"Initial data load completed in {initial_load_time:.2f} seconds")
+    assert_load_info(info)
+
+    # generate overlap data (2 days overlapping with initial data)
+    overlap_days = 2
+    new_days = 3
+    all_new_data = []
+
+    # create data for overlapping days (modify some values)
+    for day_offset in range(overlap_days):
+        current_date = base_date + timedelta(days=day_offset)
+        dates = np.array([current_date] * num_rows)
+
+        # use same IDs but different values for the overlapping data
+        new_values = np.random.random(num_rows) * 2000
+
+        table = pa.Table.from_arrays(
+            [pa.array(user_ids), pa.array(product_ids), pa.array(dates), pa.array(new_values)],
+            names=["user_id", "product_id", "event_date", "value"],
+        )
+        all_new_data.append(table)
+
+    # create data for new days
+    for day_offset in range(days, days + new_days):
+        current_date = base_date + timedelta(days=day_offset)
+        dates = np.array([current_date] * num_rows)
+
+        # different user IDs for completely new data
+        new_user_ids = np.random.randint(10000, 20000, num_rows)
+        new_values = np.random.random(num_rows) * 1500
+
+        table = pa.Table.from_arrays(
+            [pa.array(new_user_ids), pa.array(product_ids), pa.array(dates), pa.array(new_values)],
+            names=["user_id", "product_id", "event_date", "value"],
+        )
+        all_new_data.append(table)
+
+    new_combined_table = pa.concat_tables(all_new_data)
+
+    # define merge resource
+    @dlt.resource(
+        table_name="merge_test",
+        primary_key=["user_id", "product_id"],
+        merge_key="event_date",
+        write_disposition="merge",
+    )
+    def merge_data():
+        yield new_combined_table
+
+    print(f"Merging {len(new_combined_table)} rows of data with {overlap_days} days overlap...")
+    start_time = time.time()
+    merge_info = pipeline.run(merge_data(), **destination_config.run_kwargs)
+    merge_time = time.time() - start_time
+    print(f"Merge operation completed in {merge_time:.2f} seconds")
+    assert_load_info(merge_info)

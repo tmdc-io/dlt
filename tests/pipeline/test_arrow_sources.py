@@ -6,6 +6,7 @@ import pyarrow as pa
 
 import dlt
 from dlt.common import json, Decimal
+from dlt.common.time import ensure_pendulum_datetime_utc
 from dlt.common.utils import uniq_id
 from dlt.common.libs.pyarrow import (
     NameNormalizationCollision,
@@ -100,7 +101,10 @@ def test_extract_and_normalize(item_type: TPythonTableFormat, is_list: bool):
 
     # Check schema detection
     schema_columns = schema.tables["some_data"]["columns"]
-    assert set(df_tbl.columns) == set(schema_columns)
+    # null column is present, with x-normalizer seen-null-first, without data type
+    assert set(schema_columns) - set(df_tbl.columns) == {"null"}
+    assert schema_columns["null"]["x-normalizer"]["seen-null-first"] is True
+    assert "data_type" not in schema_columns["null"]
     assert schema_columns["date"]["data_type"] == "date"
     assert schema_columns["int"]["data_type"] == "bigint"
     assert schema_columns["float"]["data_type"] == "double"
@@ -151,6 +155,10 @@ def test_normalize_jsonl(item_type: TPythonTableFormat, is_list: bool):
     for res_item, exp_item in zip(result, expected):
         res_item["decimal"] = Decimal(res_item["decimal"])
         exp_item["decimal"] = Decimal(exp_item["decimal"])
+        # we normalize timestamps to UTC
+        exp_item["datetime"] = (
+            ensure_pendulum_datetime_utc(exp_item["datetime"]).isoformat().replace("+00:00", "Z")
+        )
         assert res_item == exp_item
 
 
@@ -204,7 +212,11 @@ def test_extract_normalize_file_rotation(item_type: TPythonTableFormat) -> None:
     pipeline.extract(data_frames())
     # ten parquet files
     assert len(pipeline.list_extracted_resources()) == 10
-    info = pipeline.normalize(workers=3)
+
+    os.environ["NORMALIZE__DATA_WRITER__FILE_MAX_ITEMS"] = str(len(rows))
+    os.environ["NORMALIZE__DATA_WRITER__BUFFER_MAX_ITEMS"] = str(len(rows))
+
+    info = pipeline.normalize(workers=1)
     # with 10 * num rows
     assert info.row_counts["data_frames"] == 10 * len(rows)
     load_id = pipeline.list_normalized_load_packages()[0]
@@ -352,6 +364,16 @@ def test_normalize_reorder_columns_separate_packages(item_type: TPythonTableForm
         actual_tbl_no_binary = pa.parquet.read_table(f)
         # schema must be same
         assert actual_tbl_no_binary.schema.names == shuffled_removed_column.schema.names
+        # Europe/Berlin converted to utc
+        dt_idx = shuffled_removed_column.schema.get_field_index("datetime")
+        dt_field = shuffled_removed_column.schema.field(dt_idx)
+        # cast only if the column is a timestamp
+
+        unit = dt_field.type.unit
+        utc_col = pa.compute.cast(shuffled_removed_column["datetime"], pa.timestamp(unit, "UTC"))
+        shuffled_removed_column = shuffled_removed_column.set_column(
+            dt_idx, dt_field.with_type(pa.timestamp(unit, "UTC")), utc_col
+        )
         assert actual_tbl_no_binary.schema.equals(shuffled_removed_column.schema)
     # print(pipeline.default_schema.to_pretty_yaml())
 

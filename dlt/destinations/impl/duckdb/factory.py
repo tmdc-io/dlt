@@ -55,6 +55,7 @@ class DuckDbTypeMapper(TypeMapperImpl):
         "INTEGER": "bigint",
         "BIGINT": "bigint",
         "HUGEINT": "bigint",
+        "TIMESTAMP": "timestamp",
         "TIMESTAMP_S": "timestamp",
         "TIMESTAMP_MS": "timestamp",
         "TIMESTAMP_NS": "timestamp",
@@ -76,7 +77,7 @@ class DuckDbTypeMapper(TypeMapperImpl):
         elif precision <= 128:
             return "HUGEINT"
         raise TerminalValueError(
-            f"bigint with {precision} bits precision cannot be mapped into duckdb integer type"
+            f"bigint with `{precision=:}` can't be mapped to DuckDB integer type"
         )
 
     def to_db_datetime_type(
@@ -87,9 +88,9 @@ class DuckDbTypeMapper(TypeMapperImpl):
         column_name = column["name"]
         table_name = table["name"]
         timezone = column.get("timezone", True)
-        precision = column.get("precision")
+        precision = column.get("precision", self.capabilities.timestamp_precision)
 
-        if timezone and precision is not None and precision != 6:
+        if timezone and precision != self.capabilities.timestamp_precision:
             logger.warn(
                 f"DuckDB does not support both timezone and precision for column '{column_name}' in"
                 f" table '{table_name}'. Will default to timezone. Please set timezone to False to"
@@ -100,18 +101,18 @@ class DuckDbTypeMapper(TypeMapperImpl):
             # default timestamp mapping for timezone
             return None
 
-        if precision is None or precision == 6:
-            return "TIMESTAMP"
-        elif precision == 0:
+        if precision == 0:
             return "TIMESTAMP_S"
-        elif precision == 3:
+        elif precision <= 3:
             return "TIMESTAMP_MS"
-        elif precision == 9:
+        elif precision <= 6:
+            return "TIMESTAMP"
+        elif precision <= 9:
             return "TIMESTAMP_NS"
 
         raise TerminalValueError(
-            f"DuckDB does not support precision '{precision}' for '{column_name}' in table"
-            f" '{table_name}'"
+            f"DuckDB doesn't support `{precision=:}` for datetime column `{column_name}` in table"
+            f" `{table_name}`"
         )
 
     def from_destination_type(
@@ -153,6 +154,8 @@ class duckdb(Destination[DuckDbClientConfiguration, "DuckDbClient"]):
         caps.supported_merge_strategies = ["delete-insert", "scd2"]
         caps.supported_replace_strategies = ["truncate-and-insert", "insert-from-staging"]
         caps.sqlglot_dialect = "duckdb"
+        caps.timestamp_precision = 6
+        caps.max_timestamp_precision = 9  # nanosecond precision supported
 
         return caps
 
@@ -176,13 +179,14 @@ class duckdb(Destination[DuckDbClientConfiguration, "DuckDbClient"]):
 
         Args:
             credentials (Union[DuckDbCredentials, Dict[str, Any], str, DuckDBPyConnection], optional): Credentials to connect to the duckdb database. Can be an instance of `DuckDbCredentials` or
-                a path to a database file. Use :pipeline: to create a duckdb
-                in the working folder of the pipeline
+                a path to a database file. Use :pipeline: to create a duckdb in the working folder of the pipeline.
+                Instance of `DuckDbCredentials` allows to pass extensions, configs and pragmas to be set up for connection.
             create_indexes (bool, optional): Should unique indexes be created, defaults to False
             destination_name (str, optional): Name of the destination, can be used in config section to differentiate between multiple of the same type
             environment (str, optional): Environment of the destination
             **kwargs (Any): Additional arguments passed to the destination config
         """
+
         super().__init__(
             credentials=credentials,
             create_indexes=create_indexes,

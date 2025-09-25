@@ -50,6 +50,11 @@ DLT_VALID_FROM = "_nilus_valid_from"
 DLT_VALID_TO = "_nilus_valid_to"
 
 """load id to identify records loaded in a single load package"""
+# NOTE C_DLT_LOAD_ID != C_DLT_LOADS_TABLE_LOAD_ID but they refer to the exact same entity / value.
+# They differ for backwards compatiblity reasons
+# TODO add schema migration to use `_dlt_load_id` in `_dlt_loads` table
+C_DLT_LOADS_TABLE_LOAD_ID = "load_id"
+"""load id column in the table {LOADS_TABLE_NAME}. Meant to be joined with {C_DLT_LOAD_ID} of data tables"""
 
 TColumnProp = Literal[
     "name",
@@ -151,7 +156,17 @@ class TColumnType(TypedDict, total=False):
     timezone: Optional[bool]
 
 
-class TColumnSchemaBase(TColumnType, total=False):
+# Part of Column containing processing hints added by the normalize stage
+TColumnProcessingHints = TypedDict(
+    "TColumnProcessingHints",
+    {
+        "x-normalizer": Optional[Dict[str, Any]],
+    },
+    total=False,
+)
+
+
+class TColumnSchemaBase(TColumnType, TColumnProcessingHints, total=False):
     """TypedDict that defines basic properties of a column: name, data type and nullable"""
 
     name: Optional[str]
@@ -245,6 +260,10 @@ class TMergeDispositionDict(TWriteDispositionDict):
     strategy: Optional[TLoaderMergeStrategy]
 
 
+class TDeleteInsertStrategyDict(TMergeDispositionDict):
+    deduplicated: Optional[bool]
+
+
 class TScd2StrategyDict(TMergeDispositionDict, total=False):
     validity_column_names: Optional[List[str]]
     active_record_timestamp: Optional[TAnyDateTime]
@@ -253,7 +272,11 @@ class TScd2StrategyDict(TMergeDispositionDict, total=False):
 
 
 TWriteDispositionConfig = Union[
-    TWriteDisposition, TWriteDispositionDict, TMergeDispositionDict, TScd2StrategyDict
+    TWriteDisposition,
+    TWriteDispositionDict,
+    TMergeDispositionDict,
+    TScd2StrategyDict,
+    TDeleteInsertStrategyDict,
 ]
 
 

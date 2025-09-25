@@ -35,6 +35,12 @@ class SynapseTypeMapper(MsSqlTypeMapper):
                 "time",
             )
 
+    def to_destination_type(self, column: TColumnSchema, table: PreparedTableSchema) -> str:
+        sc_t = column["data_type"]
+        if sc_t == "json":
+            return "nvarchar(%s)" % column.get("precision", "max")
+        return super().to_destination_type(column, table)
+
 
 class synapse(Destination[SynapseClientConfiguration, "SynapseClient"]):
     spec = SynapseClientConfiguration
@@ -88,16 +94,18 @@ class synapse(Destination[SynapseClientConfiguration, "SynapseClient"]):
         caps.supports_create_table_if_not_exists = (
             False  # IF NOT EXISTS on CREATE TABLE not supported
         )
+        caps.supports_multiple_statements = True
 
         # Synapse throws "Some part of your SQL statement is nested too deeply. Rewrite the query or break it up into smaller queries."
         # if number of records exceeds a certain number. Which exact number that is seems not deterministic:
-        # in tests, I've seen a query with 12230 records run succesfully on one run, but fail on a subsequent run, while the query remained exactly the same.
+        # in tests, I've seen a query with 12230 records run successfully on one run, but fail on a subsequent run, while the query remained exactly the same.
         # 10.000 records is a "safe" amount that always seems to work.
         caps.max_rows_per_insert = 10000
 
-        # datetimeoffset can store 7 digits for fractional seconds
+        # NOTE: datetimeoffset can store 7 digits for fractional seconds, maybe you could use it with parquet in ns
+        #   precision. you can pass synapse(timestamp_precision=7) to override
         # https://learn.microsoft.com/en-us/sql/t-sql/data-types/datetimeoffset-transact-sql?view=sql-server-ver16
-        caps.timestamp_precision = 7
+        caps.timestamp_precision = 6
 
         caps.supported_merge_strategies = ["delete-insert", "scd2"]
         caps.supported_replace_strategies = ["truncate-and-insert", "insert-from-staging"]

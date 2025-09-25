@@ -42,18 +42,6 @@ def resource():
     ...
 ```
 
-By default, `primary_key` deduplication is arbitrary. You can pass the `dedup_sort` column hint with a value of `desc` or `asc` to influence which record remains after deduplication. Using `desc`, the records sharing the same `primary_key` are sorted in descending order before deduplication, making sure the record with the highest value for the column with the `dedup_sort` hint remains. `asc` has the opposite behavior.
-
-```py
-@dlt.resource(
-    primary_key="id",
-    write_disposition="merge",
-    columns={"created_at": {"dedup_sort": "desc"}}  # select "latest" record
-)
-def resource():
-    ...
-```
-
 Example below merges on a column `batch_day` that holds the day for which the given record is valid.
 Merge keys also can be compound:
 
@@ -90,6 +78,20 @@ def github_repo_events(last_created_at = dlt.sources.incremental("created_at", "
 If you use the `merge` write disposition, but do not specify merge or primary keys, merge will fallback to `append`.
 The appended data will be inserted from a staging table in one transaction for most destinations in this case.
 :::
+
+### Control deduplication of staging data
+
+By default, `primary_key` deduplication is arbitrary. You can pass the `dedup_sort` column hint with a value of `desc` or `asc` to influence which record remains after deduplication. Using `desc`, the records sharing the same `primary_key` are sorted in descending order before deduplication, making sure the record with the highest value for the column with the `dedup_sort` hint remains. `asc` has the opposite behavior.
+
+```py
+@dlt.resource(
+    primary_key="id",
+    write_disposition="merge",
+    columns={"created_at": {"dedup_sort": "desc"}}  # select "latest" record
+)
+def resource():
+    ...
+```
 
 **Example: deduplication with timestamp based sorting**
 
@@ -129,6 +131,16 @@ When this resource is executed, the following deduplication rules are applied:
 2. For records with identical values in the `dedup_sort` column:
    - The first occurrence encountered is kept.
    - For example, between records with id=2 and identical `"metadata_modified"="2024-01-01"`, the first record (value="C") is kept.
+
+### Disable deduplication
+If staging data is already deduplicated (or was always clean) you can disable it. Deduplication is preformed by the database backend so you
+may save some costs:
+
+```py
+@dlt.resource(primary_key="id", write_disposition={"disposition": "merge", "strategy": "delete-insert", "deduplicated": True})
+def github_repo_events():
+    yield from _get_event_pages()
+```
 
 ### Delete records
 The `hard_delete` column hint can be used to delete records from the destination dataset. The behavior of the delete mechanism depends on the data type of the column marked with the hint:
@@ -208,29 +220,51 @@ Indexing is important for doing lookups by column value, especially for merge wr
 
 ### Forcing root key propagation
 
-Merge write disposition requires that the `_dlt_id` (`row_key`) of the root table be propagated to nested tables. This concept is similar to a foreign key but always references the root (top level) table, skipping any intermediate parents. We call it `root key`. The root key is automatically propagated for all tables that have the `merge` write disposition set. We do not enable it everywhere because it takes up storage space. Nevertheless, in some cases, you may want to permanently enable root key propagation.
+The merge write disposition requires that the `_dlt_id` (`row_key`) of the root table be propagated to nested tables. This concept is similar to a foreign key but always references the root (top level) table, skipping any intermediate parents. We call this the `root key`.
+
+`Root key` propagation is automatically enabled for all tables that have the `merge` write disposition set from the beginning. We do not always enable it by default because it takes up additional storage space. Nevertheless, in some cases, you may want to permanently enable `root key` propagation.
+
+To enable `root key` propagation on an existing source or resource, you must drop and recreate its tables, since the `_dlt_root_id` column cannot be added to tables that already contain data.
+
+For example, suppose you used the [Facebook Ads](../dlt-ecosystem/verified-sources/facebook_ads.md) verified source, where the `merge` write disposition and `root key` are not enabled by default, to load the `ads` resource:
+```py
+pipeline = dlt.pipeline(
+    pipeline_name='facebook_ads_pipeline',
+    destination='duckdb',
+    dataset_name='facebook_ads_data',
+)
+my_facebook_ads = facebook_ads_source()
+pipeline.run(my_facebook_ads.with_resources("ads"))
+```
+
+If you want to change the `ads` resource to use `merge`, you must first drop the existing resource tables from the destination:
+
+```sh
+dlt pipeline facebook_ads_pipeline drop ads
+```
+
+This command removes the `ads` table and all its nested tables from the destination, allowing them to be later recreated with a schema that includes the `_dlt_root_id` column.
+
+Next, enable `root key` propagation and run the pipeline once with `replace`, followed by `merge`:
 
 ```py
 pipeline = dlt.pipeline(
-    pipeline_name='facebook_insights',
+    pipeline_name='facebook_ads_pipeline',
     destination='duckdb',
-    dataset_name='facebook_insights_data',
-    dev_mode=True
+    dataset_name='facebook_ads_data',
 )
-fb_ads = facebook_ads_source()
-# enable root key propagation on a source that is not a merge one by default.
-# this is not required if you always use merge but below we start with replace
-fb_ads.root_key = True
-# load only disapproved ads
-fb_ads.ads.bind(states=("DISAPPROVED", ))
-info = pipeline.run(fb_ads.with_resources("ads"), write_disposition="replace")
-# merge the paused ads. the disapproved ads stay there!
-fb_ads = facebook_ads_source()
-fb_ads.ads.bind(states=("PAUSED", ))
-info = pipeline.run(fb_ads.with_resources("ads"), write_disposition="merge")
+my_facebook_ads = facebook_ads_source()
+
+my_facebook_ads.root_key = True
+
+pipeline.run(my_facebook_ads.with_resources("ads"), write_disposition="replace")
+
+pipeline.run(my_facebook_ads.with_resources("ads"), write_disposition="merge")
 ```
 
-In the example above, we enforce the root key propagation with `fb_ads.root_key = True`. This ensures that the correct data is propagated on the initial `replace` load so the future `merge` load can be executed. You can achieve the same in the decorator `@dlt.source(root_key=True)`.
+In this example, enabling `my_facebook_ads.root_key = True` and running the pipeline once with `replace` ensures that the tables are recreated with the `_dlt_root_id` column. Once this column is present, subsequent `merge` runs can be executed successfully.
+
+If you have defined your own source with the `@dlt.source` decorator, you can also enable `root key` propagation by adding `@dlt.source(root_key=True)`.
 
 ## `scd2` strategy
 `dlt` can create [Slowly Changing Dimension Type 2](https://en.wikipedia.org/wiki/Slowly_changing_dimension#Type_2:_add_new_row) (SCD2) destination tables for dimension tables that change in the source. By default, the resource is expected to provide a full extract of the source table each run, but [incremental extracts](#example-incremental-scd2) are also possible. A row hash is stored in `_dlt_id` and used as surrogate key to identify source records that have been inserted, updated, or deleted. A `NULL` value is used by default to indicate an active record, but it's possible to use a configurable high timestamp (e.g. 9999-12-31 00:00:00.000000) instead.
@@ -449,6 +483,12 @@ pipeline.run(some_data())  # third run — 2024-01-03 10:30:05.750356
 | 2024-01-03 03:01:11.943703 | NULL | 2024-01-02 | d |
 | **2024-01-03 10:30:05.750356** | **NULL** | **2024-01-01** | **bb** |
 
+### Handling nested structures with SCD type 2
+To explore how SCD Type 2 handles nested JSON structures, refer to the hands-on demonstration provided in the Colab Notebook linked below.
+
+Execute all steps directly in your browser:
+[Open in Colab.](https://colab.research.google.com/drive/1GpG3JKGWveB-kR7eNvlJLr6oO0nM7Fbv?usp=sharing)
+
 
 ### Example: configure validity column names
 `_dlt_valid_from` and `_dlt_valid_to` are used by default as validity column names. Other names can be configured as follows:
@@ -554,7 +594,7 @@ The `upsert` merge strategy is currently supported for these destinations:
 - `mssql`
 - `postgres`
 - `snowflake`
-- `filesystem` with `delta` table format (see limitations [here](../dlt-ecosystem/destinations/delta-iceberg#known-limitations))
+- `filesystem` with `delta` table format (see limitations [here](../dlt-ecosystem/destinations/delta-iceberg#known-limitations)) and `iceberg` table format
 :::
 
 The `upsert` merge strategy does primary-key based *upserts*:

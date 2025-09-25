@@ -1,13 +1,15 @@
+import os
 import yaml
 from typing import Any, Optional, Sequence, Tuple
 import dlt
 from dlt.cli.exceptions import CliCommandInnerException
 
 from dlt.common.json import json
-from dlt.common.pipeline import resource_state, get_dlt_pipelines_dir, TSourceState
+from dlt.common.pipeline import get_dlt_pipelines_dir, TSourceState
 from dlt.common.destination.reference import TDestinationReferenceArg
 from dlt.common.runners import Venv
 from dlt.common.runners.stdout import iter_stdout
+from dlt.common.runtime import run_context
 from dlt.common.schema.utils import (
     group_tables_by_resource,
     has_table_seen_data,
@@ -15,6 +17,8 @@ from dlt.common.schema.utils import (
     remove_defaults,
 )
 from dlt.common.storages import FileStorage, PackageStorage
+
+from dlt.extract.state import resource_state
 from dlt.pipeline.helpers import DropCommand
 from dlt.pipeline.exceptions import CannotRestorePipelineException
 
@@ -33,7 +37,6 @@ def pipeline_command(
     verbosity: int,
     dataset_name: str = None,
     destination: TDestinationReferenceArg = None,
-    hot_reload: Optional[bool] = False,
     **command_kwargs: Any,
 ) -> None:
     if operation == "list":
@@ -46,6 +49,18 @@ def pipeline_command(
             fmt.echo("No pipelines found in %s" % fmt.bold(pipelines_dir))
         for _dir in dirs:
             fmt.secho(_dir, fg="green")
+        return
+
+    # we may open the dashboard for a pipeline without checking if it exists
+    if operation == "show" and not command_kwargs.get("streamlit"):
+        # TODO: why this is imported here
+        from dlt.common.utils import custom_environ
+        from dlt.common.known_env import DLT_DATA_DIR
+
+        from dlt.helpers.dashboard.runner import run_dashboard
+
+        run_dashboard(pipeline_name, edit=command_kwargs.get("edit"), pipelines_dir=pipelines_dir)
+        # return so streamlit does not run
         return
 
     try:
@@ -114,20 +129,15 @@ def pipeline_command(
 
     if operation == "show":
         from dlt.common.runtime import signals
-        from dlt.helpers.streamlit_app import index
 
         with signals.delayed_signals():
             streamlit_cmd = [
                 "streamlit",
                 "run",
-                index.__file__,
+                os.path.join(os.path.dirname(dlt.__file__), "helpers", "streamlit_app", "index.py"),
                 "--client.showSidebarNavigation",
                 "false",
             ]
-
-            if hot_reload:
-                streamlit_cmd.append("--server.runOnSave")
-                streamlit_cmd.append("true")
 
             streamlit_cmd.append("--")
             streamlit_cmd.append(pipeline_name)
@@ -156,7 +166,14 @@ def pipeline_command(
         fmt.echo()
         fmt.echo("Local state:")
         for k, v in state["_local"].items():
-            if not isinstance(v, dict):
+            if isinstance(v, dict):
+                # show run context id
+                if k == "last_run_context":
+                    k = "last_run_context['uri']"
+                    v = v["uri"]
+                else:
+                    v = None
+            if v is not None:
                 fmt.echo("%s: %s" % (fmt.style(k, fg="green"), v))
         fmt.echo()
         if p.default_schema_name is None:
@@ -329,9 +346,16 @@ def pipeline_command(
         remove_defaults_ = command_kwargs.get("remove_defaults")
         s = p.default_schema
         if format_ == "json":
-            schema_str = json.dumps(s.to_dict(remove_defaults=remove_defaults_), pretty=True)
+            schema_str = s.to_pretty_json(remove_defaults=remove_defaults_)
+        elif format_ == "yaml":
+            schema_str = s.to_pretty_yaml(remove_defaults=remove_defaults_)
+        elif format_ == "dbml":
+            schema_str = s.to_dbml()
+        elif format_ == "dot":
+            schema_str = s.to_dot()
         else:
             schema_str = s.to_pretty_yaml(remove_defaults=remove_defaults_)
+
         fmt.echo(schema_str)
 
     if operation == "drop":
@@ -347,6 +371,26 @@ def pipeline_command(
                 for warning in drop.info["warnings"]:
                     fmt.warning(warning)
             return
+
+        # drop command will fail if first run but that happens later, so we make sure that last_run_context exists
+        if not p.first_run:
+            from dlt.common.runtime import run_context
+
+            active_run_dir = os.path.abspath(run_context.active().run_dir)
+
+            if p.last_run_context["run_dir"] != active_run_dir:
+                fmt.warning(
+                    fmt.style(
+                        "You should run this from the same directory as the pipeline script (%s),"
+                        " where the folder with credentials (%s) is located. Alternatively, you can"
+                        " set the required credentials as environment variables."
+                        % (
+                            p.last_run_context["run_dir"],
+                            p.last_run_context["settings_dir"],
+                        ),
+                        fg="yellow",
+                    )
+                )
 
         fmt.echo(
             "About to drop the following data in dataset %s in destination %s:"

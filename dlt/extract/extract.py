@@ -16,7 +16,6 @@ from dlt.common.pipeline import (
     ExtractMetrics,
     SupportsPipeline,
     WithStepInfo,
-    reset_resource_state,
 )
 from dlt.common.typing import TColumnNames, TLoaderFileFormat
 from dlt.common.runtime import signals
@@ -28,7 +27,6 @@ from dlt.common.schema.typing import (
     TTableFormat,
     TWriteDispositionConfig,
 )
-from dlt.common.schema.utils import normalize_schema_name
 from dlt.common.storages import NormalizeStorageConfiguration, LoadPackageInfo, SchemaStorage
 from dlt.common.storages.load_package import (
     ParsedLoadJobFileName,
@@ -51,6 +49,7 @@ from dlt.extract.reference import SourceReference
 from dlt.extract.resource import DltResource
 from dlt.extract.storage import ExtractStorage
 from dlt.extract.extractors import ObjectExtractor, ArrowExtractor, Extractor, ModelExtractor
+from dlt.extract.state import reset_resource_state
 from dlt.extract.utils import get_data_item_format, make_schema_with_default_name
 
 
@@ -179,7 +178,7 @@ def data_to_sources(
     # apply hints and settings
     for source in sources:
         apply_settings(source)
-        for resource in source.selected_resources.values():
+        for resource in source.resources.extracted:
             apply_hint_args(resource)
 
     return sources
@@ -384,7 +383,7 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                             left_gens -= delta
                             collector.update("Resources", delta)
                         signals.raise_if_signalled()
-                        resource = source.resources[pipe_item.pipe.name]
+                        resource = source.resources.with_pipe(pipe_item.pipe)
                         item_format = get_data_item_format(pipe_item.item)
                         extractors[item_format].write_items(
                             resource, pipe_item.item, pipe_item.meta
@@ -429,15 +428,15 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         load_id = self.extract_storage.create_load_package(
             source.schema, reuse_exiting_package=True
         )
-        with Container().injectable_context(
-            SourceSchemaInjectableContext(source.schema)
-        ), Container().injectable_context(
-            SourceInjectableContext(source)
-        ), Container().injectable_context(
-            LoadPackageStateInjectableContext(
-                load_id=load_id, storage=self.extract_storage.new_packages
-            )
-        ) as load_package:
+        with (
+            Container().injectable_context(SourceSchemaInjectableContext(source.schema)),
+            Container().injectable_context(SourceInjectableContext(source)),
+            Container().injectable_context(
+                LoadPackageStateInjectableContext(
+                    load_id=load_id, storage=self.extract_storage.new_packages
+                )
+            ) as load_package,
+        ):
             # inject the config section with the current source name
             with inject_section(
                 ConfigSectionContext(
@@ -449,10 +448,9 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
                     load_package.state.update(load_package_state_update)
 
                 # reset resource states, the `extracted` list contains all the explicit resources and all their parents
-                for resource in source.resources.extracted.values():
-                    with contextlib.suppress(DataItemRequiredForDynamicTableHints):
-                        if resource.write_disposition == "replace":
-                            reset_resource_state(resource.name)
+                for resource in source.resources.extracted:
+                    if resource.write_disposition == "replace":
+                        reset_resource_state(resource.name)
 
                 self._extract_single_source(
                     load_id,

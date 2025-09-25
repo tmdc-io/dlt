@@ -12,6 +12,8 @@ from dlt.common.typing import TLoaderFileFormat
 from dlt.common.utils import without_none
 
 
+# NOTE it seems that multiple methods pass `table` only for logging/exception purposes
+# should refactor to remove `table` kwarg and have callers catch exceptions
 class TypeMapperImpl(DataTypeMapper):
     sct_to_unbound_dbt: Dict[TDataType, str]
     """Data types without precision or scale specified (e.g. `"text": "varchar"` in postgres)"""
@@ -49,7 +51,7 @@ class TypeMapperImpl(DataTypeMapper):
                 " destination. One or both of these flags were used in column"
                 f" '{column.get('name')}'."
             )
-            # TODO: refactor lancedb and wevavite to make table object required
+            # TODO: refactor lancedb and weaviate to make table object required
             if table:
                 message += f" in table '{table.get('name')}'."
 

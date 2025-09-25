@@ -114,9 +114,9 @@ def test_athena_all_datatypes_and_timestamps(
         db_row = list(db_rows[0])
         # content must equal
         assert_all_data_types_row(
+            sql_client.capabilities,
             db_row[:-2],
             parse_json_strings=True,
-            timestamp_precision=sql_client.capabilities.timestamp_precision,
             schema=column_schemas,
         )
 
@@ -227,9 +227,7 @@ def test_athena_file_layouts(destination_config: DestinationTestConfiguration, l
     info = pipeline.run(resources, **destination_config.run_kwargs)
     assert_load_info(info)
 
-    table_counts = load_table_counts(
-        pipeline, *[t["name"] for t in pipeline.default_schema.data_tables()]
-    )
+    table_counts = load_table_counts(pipeline)
     assert table_counts == {"items1": 3, "items2": 7}
 
 

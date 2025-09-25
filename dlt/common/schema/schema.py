@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from copy import copy, deepcopy
 from typing import (
     Callable,
@@ -11,21 +13,19 @@ from typing import (
     Any,
     cast,
 )
-from dlt.common.schema.migrations import migrate_schema
 
-from dlt.common.utils import extend_list_deduplicated
+from dlt.common.schema.migrations import migrate_schema
+from dlt.common.utils import extend_list_deduplicated, simple_repr, without_none
 from dlt.common.typing import (
     DictStrAny,
     StrAny,
     REPattern,
-    SupportsVariant,
-    VARIANT_FIELD_FORMAT,
     TDataItem,
 )
 from dlt.common.normalizers import TNormalizersConfig, NamingConvention
 from dlt.common.normalizers.json import DataItemNormalizer, TNormalizedRowIterator
 from dlt.common.schema import utils
-from dlt.common.data_types import py_type_to_sc_type, coerce_value, TDataType
+from dlt.common.data_types import TDataType
 from dlt.common.schema.typing import (
     DLT_NAME_PREFIX,
     SCHEMA_ENGINE_VERSION,
@@ -43,15 +43,12 @@ from dlt.common.schema.typing import (
     TTableSchemaColumns,
     TColumnSchema,
     TColumnProp,
-    TColumnHint,
     TColumnDefaultHint,
     TTypeDetections,
     TSchemaContractDict,
     TSchemaContract,
 )
 from dlt.common.schema.exceptions import (
-    CannotCoerceColumnException,
-    CannotCoerceNullException,
     InvalidSchemaName,
     ParentTableNotFoundException,
     SchemaCorruptedException,
@@ -169,91 +166,6 @@ class Schema:
     ) -> TNormalizedRowIterator:
         return self.data_item_normalizer.normalize_data_item(item, load_id, table_name)
 
-    def filter_row(self, table_name: str, row: StrAny) -> StrAny:
-        # TODO: remove this. move to extract stage
-        # exclude row elements according to the rules in `filter` elements of the table
-        # include rules have precedence and are used to make exceptions to exclude rules
-        # the procedure will apply rules from the table_name and it's all parent tables up until root
-        # parent tables are computed by `normalize_break_path` function so they do not need to exist in the schema
-        # note: the above is not very clean. the `parent` element of each table should be used but as the rules
-        #  are typically used to prevent not only table fields but whole tables from being created it is not possible
-
-        if not self._compiled_excludes:
-            # if there are no excludes in the whole schema, no modification to a row can be made
-            # most of the schema do not use them
-            return row
-
-        def _exclude(
-            path: str, excludes: Sequence[REPattern], includes: Sequence[REPattern]
-        ) -> bool:
-            is_included = False
-            is_excluded = any(exclude.search(path) for exclude in excludes)
-            if is_excluded:
-                # we may have exception if explicitly included
-                is_included = any(include.search(path) for include in includes)
-            return is_excluded and not is_included
-
-        # break table name in components
-        branch = self.naming.break_path(table_name)
-
-        # check if any of the rows is excluded by rules in any of the tables
-        for i in range(len(branch), 0, -1):  # stop is exclusive in `range`
-            # start at the top level table
-            c_t = self.naming.make_path(*branch[:i])
-            excludes = self._compiled_excludes.get(c_t)
-            # only if there's possibility to exclude, continue
-            if excludes:
-                includes = self._compiled_includes.get(c_t) or []
-                for field_name in list(row.keys()):
-                    path = self.naming.make_path(*branch[i:], field_name)
-                    if _exclude(path, excludes, includes):
-                        # TODO: copy to new instance
-                        del row[field_name]  # type: ignore
-            # if row is empty, do not process further
-            if not row:
-                break
-        return row
-
-    def coerce_row(
-        self, table_name: str, parent_table: str, row: StrAny
-    ) -> Tuple[DictStrAny, TPartialTableSchema]:
-        """Fits values of fields present in `row` into a schema of `table_name`. Will coerce values into data types and infer new tables and column schemas.
-
-        Method expects that field names in row are already normalized.
-        * if table schema for `table_name` does not exist, new table is created
-        * if column schema for a field in `row` does not exist, it is inferred from data
-        * if incomplete column schema (no data type) exists, column is inferred from data and existing hints are applied
-        * fields with None value are removed
-
-        Returns tuple with row with coerced values and a partial table containing just the newly added columns or None if no changes were detected
-        """
-        # get existing or create a new table
-        updated_table_partial: TPartialTableSchema = None
-        table = self._schema_tables.get(table_name)
-        if not table:
-            table = utils.new_table(table_name, parent_table)
-        table_columns = table["columns"]
-
-        new_row: DictStrAny = {}
-        for col_name, v in row.items():
-            # skip None values, we should infer the types later
-            if v is None:
-                # just check if column is nullable if it exists
-                self._coerce_null_value(table_columns, table_name, col_name)
-            else:
-                new_col_name, new_col_def, new_v = self._coerce_non_null_value(
-                    table_columns, table_name, col_name, v
-                )
-                new_row[new_col_name] = new_v
-                if new_col_def:
-                    if not updated_table_partial:
-                        # create partial table with only the new columns
-                        updated_table_partial = copy(table)
-                        updated_table_partial["columns"] = {}
-                    updated_table_partial["columns"][new_col_name] = new_col_def
-
-        return new_row, updated_table_partial
-
     def apply_schema_contract(
         self,
         schema_contract: TSchemaContractDict,
@@ -309,7 +221,7 @@ class Schema:
                     None,
                     schema_contract,
                     data_item,
-                    f"Trying to add table {table_name} but new tables are frozen.",
+                    f"Can't add table `{table_name}` because `tables` are frozen.",
                 )
             # filter tables with name below
             return None, [("tables", table_name, schema_contract["tables"])]
@@ -338,8 +250,8 @@ class Schema:
                         existing_table,
                         schema_contract,
                         data_item,
-                        f"Trying to add column {column_name} to table {table_name} but columns are"
-                        " frozen.",
+                        f"Can't add table column `{column_name}` to table `{table_name}` because"
+                        " `columns` are frozen.",
                     )
                 # filter column with name below
                 filters.append(("columns", column_name, column_mode))
@@ -358,8 +270,8 @@ class Schema:
                         existing_table,
                         schema_contract,
                         data_item,
-                        f"Trying to create new variant column {column_name} to table"
-                        f" {table_name} but data_types are frozen.",
+                        f"Can't add variant column `{column_name}` for table `{table_name}`"
+                        " because `data_types` are frozen.",
                     )
                 # filter column with name below
                 filters.append(("columns", column_name, data_mode))
@@ -406,7 +318,8 @@ class Schema:
         from_diff: bool = False,
     ) -> TPartialTableSchema:
         """Adds or merges `partial_table` into the schema. Identifiers are normalized by default.
-        `from_diff`
+        if `from_diff` is True, then `partial_table` is assumed to be a diff (contains only differences)
+        vs. table in schema. in that case diff will not be created but directly applied
         """
         parent_table_name = partial_table.get("parent")
         if normalize_identifiers:
@@ -537,9 +450,9 @@ class Schema:
         if len(existing_columns) != len(casefold_existing):
             raise SchemaCorruptedException(
                 self.name,
-                f"A set of existing columns passed to get_new_table_columns table {table_name} has"
-                " colliding names when case insensitive comparison is used. Original names:"
-                f" {list(existing_columns.keys())}. Case-folded names:"
+                "A set of existing columns passed to `get_new_table_columns` table"
+                f" `{table_name}` has colliding names when case insensitive comparison is used."
+                f" Original names: {list(existing_columns.keys())}. Case-folded names:"
                 f" {list(casefold_existing.keys())}",
             )
         diff_c: List[TColumnSchema] = []
@@ -676,6 +589,27 @@ class Schema:
     def settings(self) -> TSchemaSettings:
         return self._settings
 
+    def __repr__(self) -> str:
+        kwargs = {
+            "name": self.name,
+            "version": self.version,
+            "tables": list(self.tables),
+            "version_hash": self.version_hash,
+        }
+        return simple_repr("dlt.Schema", **without_none(kwargs))
+
+    def _repr_html_(self, **kwargs: Any) -> str:
+        """Render the Schema has a graphviz graph and display it using HTML
+
+        This method is automatically called by notebooks renderers (IPython, marimo, etc.)
+        ref: https://ipython.readthedocs.io/en/stable/config/integrating.html
+
+        `dlt.helpers.graphviz.render_with_html()` has not external Python or system dependencies.
+        """
+        from dlt.helpers.graphviz import _render_dot_with_html
+
+        return _render_dot_with_html(self.to_dot(**kwargs))
+
     def to_dict(
         self,
         remove_defaults: bool = False,
@@ -727,6 +661,78 @@ class Schema:
         )
         return utils.to_pretty_yaml(d)
 
+    def to_dbml(
+        self,
+        remove_processing_hints: bool = False,
+        include_dlt_tables: bool = True,
+        include_internal_dlt_ref: bool = True,
+        include_parent_child_ref: bool = True,
+        include_root_child_ref: bool = True,
+        group_by_resource: bool = False,
+    ) -> str:
+        from dlt.helpers.dbml import schema_to_dbml
+
+        stored_schema = self.to_dict(
+            # setting this to `True` removes `name` fields that are used in `schema_to_dbml()`
+            # if required, we can refactor `dlt.helpers.dbml` to support this
+            remove_defaults=False,
+            remove_processing_hints=remove_processing_hints,
+        )
+
+        # NOTE `allow_custom_dbml_properties` is not exposed because it produces invalid DBML
+        dbml_schema = schema_to_dbml(
+            stored_schema,
+            include_dlt_tables=include_dlt_tables,
+            include_internal_dlt_ref=include_internal_dlt_ref,
+            include_parent_child_ref=include_parent_child_ref,
+            include_root_child_ref=include_root_child_ref,
+            group_by_resource=group_by_resource,
+        )
+        return str(dbml_schema.dbml)
+
+    def to_dot(
+        self,
+        remove_processing_hints: bool = False,
+        include_dlt_tables: bool = True,
+        include_internal_dlt_ref: bool = True,
+        include_parent_child_ref: bool = True,
+        include_root_child_ref: bool = True,
+        group_by_resource: bool = False,
+    ) -> str:
+        """Convert schema to a Graphviz DOT string.
+
+        Args:
+            remove_processing_hints: If True, remove hints used for data processing and redundant information.
+                This reduces the size of the schema and improves readability.
+            include_dlt_tables: If True, include data tables and internal dlt tables. This will influence table
+                references and groups produced.
+            include_internal_dlt_ref: If True, include references between tables `_dlt_version`, `_dlt_loads` and `_dlt_pipeline_state`
+            include_parent_child_ref: If True, include references from `child._dlt_parent_id` to `parent._dlt_id`
+            include_root_child_ref: If True, include references from `child._dlt_root_id` to `root._dlt_id`
+            group_by_resource: If True, group tables by resource and create subclusters.
+
+        Returns:
+            A DOT string of the schema
+        """
+        from dlt.helpers.graphviz import schema_to_graphviz
+
+        stored_schema = self.to_dict(
+            # setting this to `True` removes `name` fields that are used in `schema_to_dbml()`
+            # if required, we can refactor `dlt.helpers.dbml` to support this
+            remove_defaults=False,
+            remove_processing_hints=remove_processing_hints,
+        )
+
+        dot = schema_to_graphviz(
+            stored_schema,
+            include_dlt_tables=include_dlt_tables,
+            include_internal_dlt_ref=include_internal_dlt_ref,
+            include_parent_child_ref=include_parent_child_ref,
+            include_root_child_ref=include_root_child_ref,
+            group_by_resource=group_by_resource,
+        )
+        return dot
+
     def clone(
         self,
         with_name: str = None,
@@ -776,131 +782,6 @@ class Schema:
             self._settings.pop("schema_contract", None)
         else:
             self._settings["schema_contract"] = settings
-
-    def _infer_column(
-        self, k: str, v: Any, data_type: TDataType = None, is_variant: bool = False
-    ) -> TColumnSchema:
-        column_schema = TColumnSchema(
-            name=k,
-            data_type=data_type or self._infer_column_type(v, k),
-            nullable=not self._infer_hint("not_null", k),
-        )
-        # check other preferred hints that are available
-        for hint in self._compiled_hints:
-            # already processed
-            if hint == "not_null":
-                continue
-            column_prop = utils.hint_to_column_prop(hint)
-            hint_value = self._infer_hint(hint, k)
-            # set only non-default values
-            if not utils.has_default_column_prop_value(column_prop, hint_value):
-                column_schema[column_prop] = hint_value
-
-        if is_variant:
-            column_schema["variant"] = is_variant
-        return column_schema
-
-    def _coerce_null_value(
-        self, table_columns: TTableSchemaColumns, table_name: str, col_name: str
-    ) -> None:
-        """Raises when column is explicitly not nullable"""
-        if col_name in table_columns:
-            existing_column = table_columns[col_name]
-            if not utils.is_nullable_column(existing_column):
-                raise CannotCoerceNullException(self.name, table_name, col_name)
-
-    def _coerce_non_null_value(
-        self,
-        table_columns: TTableSchemaColumns,
-        table_name: str,
-        col_name: str,
-        v: Any,
-        is_variant: bool = False,
-    ) -> Tuple[str, TColumnSchema, Any]:
-        new_column: TColumnSchema = None
-        existing_column = table_columns.get(col_name)
-        # if column exist but is incomplete then keep it as new column
-        if existing_column and not utils.is_complete_column(existing_column):
-            new_column = existing_column
-            existing_column = None
-
-        # infer type or get it from existing table
-        col_type = (
-            existing_column["data_type"]
-            if existing_column
-            else self._infer_column_type(v, col_name, skip_preferred=is_variant)
-        )
-        # get data type of value
-        py_type = py_type_to_sc_type(type(v))
-        # and coerce type if inference changed the python type
-        try:
-            coerced_v = coerce_value(col_type, py_type, v)
-        except (ValueError, SyntaxError):
-            if is_variant:
-                # this is final call: we cannot generate any more auto-variants
-                raise CannotCoerceColumnException(
-                    self.name,
-                    table_name,
-                    col_name,
-                    py_type,
-                    table_columns[col_name]["data_type"],
-                    v,
-                )
-            # otherwise we must create variant extension to the table
-            # backward compatibility for complex types: if such column exists then use it
-            variant_col_name = self.naming.shorten_fragments(
-                col_name, VARIANT_FIELD_FORMAT % py_type
-            )
-            if py_type == "json":
-                old_complex_col_name = self.naming.shorten_fragments(
-                    col_name, VARIANT_FIELD_FORMAT % "complex"
-                )
-                if old_column := table_columns.get(old_complex_col_name):
-                    if old_column.get("variant"):
-                        variant_col_name = old_complex_col_name
-            # pass final=True so no more auto-variants can be created recursively
-            return self._coerce_non_null_value(
-                table_columns, table_name, variant_col_name, v, is_variant=True
-            )
-
-        # if coerced value is variant, then extract variant value
-        # note: checking runtime protocols with isinstance(coerced_v, SupportsVariant): is extremely slow so we check if callable as every variant is callable
-        if callable(coerced_v):  # and isinstance(coerced_v, SupportsVariant):
-            coerced_v = coerced_v()
-            if isinstance(coerced_v, tuple):
-                # variant recovered so call recursively with variant column name and variant value
-                variant_col_name = self.naming.shorten_fragments(
-                    col_name, VARIANT_FIELD_FORMAT % coerced_v[0]
-                )
-                return self._coerce_non_null_value(
-                    table_columns, table_name, variant_col_name, coerced_v[1], is_variant=True
-                )
-
-        if not existing_column:
-            inferred_column = self._infer_column(
-                col_name, v, data_type=col_type, is_variant=is_variant
-            )
-            # if there's incomplete new_column then merge it with inferred column
-            if new_column:
-                # use all values present in incomplete column to override inferred column - also the defaults
-                new_column = utils.merge_column(inferred_column, new_column)
-            else:
-                new_column = inferred_column
-
-        return col_name, new_column, coerced_v
-
-    def _infer_column_type(self, v: Any, col_name: str, skip_preferred: bool = False) -> TDataType:
-        tv = type(v)
-        # try to autodetect data type
-        mapped_type = utils.autodetect_sc_type(self._type_detections, tv, v)
-        # if not try standard type mapping
-        if mapped_type is None:
-            mapped_type = py_type_to_sc_type(tv)
-        # get preferred type based on column name
-        preferred_type: TDataType = None
-        if not skip_preferred:
-            preferred_type = self.get_preferred_type(col_name)
-        return preferred_type or mapped_type
 
     def _infer_hint(self, hint_type: TColumnDefaultHint, col_name: str) -> bool:
         if hint_type in self._compiled_hints:
@@ -1035,7 +916,7 @@ class Schema:
                         table["name"],
                         to_naming,
                         from_naming,
-                        f"Attempt to rename table name to {norm_table['name']}.",
+                        f"Attempt to rename table to `{norm_table['name']}`.",
                     )
                 # if len(norm_table["columns"]) != len(table["columns"]):
                 #     print(norm_table["columns"])
@@ -1056,7 +937,7 @@ class Schema:
                         table["name"],
                         to_naming,
                         from_naming,
-                        f"Some columns got renamed to {col_diff}.",
+                        f"Some columns got renamed to `{col_diff}`.",
                     )
 
         naming_changed = from_naming and type(from_naming) is not type(to_naming)
@@ -1104,7 +985,7 @@ class Schema:
                     "-",
                     to_naming,
                     from_naming,
-                    "Schema contains tables that received data. As a precaution changing naming"
+                    "Schema contains tables that received data. As a precaution, changing naming"
                     " conventions is disallowed until full identifier lineage is implemented.",
                 )
             # re-index the table names
@@ -1134,7 +1015,7 @@ class Schema:
             if not table_name.startswith(self._dlt_tables_prefix):
                 raise SchemaCorruptedException(
                     self.name,
-                    f"A naming convention {self.naming.name()} mangles _dlt table prefix to"
+                    f"A naming convention `{self.naming.name()}` mangles `_dlt` table prefix to"
                     f" '{self._dlt_tables_prefix}'. A table '{table_name}' does not start with it.",
                 )
         # normalize default hints
@@ -1200,11 +1081,11 @@ class Schema:
         self._schema_tables = stored_schema.get("tables") or {}
         if self.version_table_name not in self._schema_tables:
             raise SchemaCorruptedException(
-                stored_schema["name"], f"Schema must contain table {self.version_table_name}"
+                stored_schema["name"], f"Schema must contain table `{self.version_table_name}`"
             )
         if self.loads_table_name not in self._schema_tables:
             raise SchemaCorruptedException(
-                stored_schema["name"], f"Schema must contain table {self.loads_table_name}"
+                stored_schema["name"], f"Schema must contain table `{self.loads_table_name}`"
             )
         self._stored_version = stored_schema["version"]
         self._stored_version_hash = stored_schema["version_hash"]
@@ -1247,6 +1128,3 @@ class Schema:
         del state["naming"]
         del state["data_item_normalizer"]
         return state
-
-    def __repr__(self) -> str:
-        return f"Schema {self.name} at {id(self)}"

@@ -24,11 +24,6 @@ from dlt.common.configuration.specs import (
 )
 from dlt.common.configuration.container import Container
 from dlt.common.exceptions import PipelineException
-from dlt.common.pipeline import (
-    unset_current_pipe_name,
-    set_current_pipe_name,
-    get_current_pipe_name,
-)
 from dlt.common.utils import get_callable_name
 
 from dlt.extract.exceptions import (
@@ -42,6 +37,7 @@ from dlt.extract.exceptions import (
 )
 from dlt.extract.pipe import Pipe
 from dlt.extract.items import DataItemWithMeta, PipeItem, ResolvablePipeItem, SourcePipeItem
+from dlt.extract.state import pipe_context
 from dlt.extract.utils import wrap_async_iterator
 from dlt.extract.concurrency import FuturesPool
 
@@ -200,49 +196,51 @@ class PipeIterator(Iterator[PipeItem]):
                 pipe_item = None
                 continue
 
-            if isinstance(item, Awaitable) or callable(item):
-                # Callables are submitted to the pool to be executed in the background
-                self._futures_pool.submit(pipe_item)  # type: ignore[arg-type]
-                pipe_item = None
-                # Future will be resolved later, move on to the next item
-                continue
+            with pipe_context(pipe_item.pipe):
+                if isinstance(item, Awaitable) or callable(item):
+                    # Callables are submitted to the pool to be executed in the background
+                    self._futures_pool.submit(pipe_item)  # type: ignore[arg-type]
+                    pipe_item = None
+                    # Future will be resolved later, move on to the next item
+                    continue
 
-            # if we are at the end of the pipe then yield element
-            if pipe_item.step == len(pipe_item.pipe) - 1:
-                # must be resolved
-                if isinstance(item, (Iterator, Awaitable, AsyncIterator)) or callable(item):
-                    raise PipeItemProcessingError(
+                # if we are at the end of the pipe then yield element
+                if pipe_item.step == len(pipe_item.pipe) - 1:
+                    # must be resolved
+                    if isinstance(item, (Iterator, Awaitable, AsyncIterator)) or callable(item):
+                        raise PipeItemProcessingError(
+                            pipe_item.pipe.name,
+                            f"Pipe item of type `{type(pipe_item.item).__name__}` was not fully"
+                            f" evaluated at step `{pipe_item.step}`. This is an internal error or"
+                            " you're yielding unexpected object from resources (e.g., fucntions,"
+                            " awaitables).",
+                        )
+                    # mypy not able to figure out that item was resolved
+                    return pipe_item  # type: ignore
+
+                # advance to next step
+                step = pipe_item.pipe[pipe_item.step + 1]
+                try:
+                    next_meta = pipe_item.meta
+                    next_item = step(item, meta=pipe_item.meta)  # type: ignore
+                    if isinstance(next_item, DataItemWithMeta):
+                        next_meta = next_item.meta
+                        next_item = next_item.data
+                except TypeError as ty_ex:
+                    assert callable(step)
+                    raise InvalidStepFunctionArguments(
                         pipe_item.pipe.name,
-                        f"Pipe item at step {pipe_item.step} was not fully evaluated and is of type"
-                        f" {type(pipe_item.item).__name__}. This is internal error or you are"
-                        " yielding something weird from resources ie. functions or awaitables.",
+                        get_callable_name(step),
+                        inspect.signature(step),
+                        str(ty_ex),
                     )
-                # mypy not able to figure out that item was resolved
-                return pipe_item  # type: ignore
+                except (PipelineException, ExtractorException, DltSourceException, PipeException):
+                    raise
+                except Exception as ex:
+                    raise ResourceExtractionError(
+                        pipe_item.pipe.name, step, str(ex), "transform"
+                    ) from ex
 
-            # advance to next step
-            step = pipe_item.pipe[pipe_item.step + 1]
-            try:
-                set_current_pipe_name(pipe_item.pipe.name)
-                next_meta = pipe_item.meta
-                next_item = step(item, meta=pipe_item.meta)  # type: ignore
-                if isinstance(next_item, DataItemWithMeta):
-                    next_meta = next_item.meta
-                    next_item = next_item.data
-            except TypeError as ty_ex:
-                assert callable(step)
-                raise InvalidStepFunctionArguments(
-                    pipe_item.pipe.name,
-                    get_callable_name(step),
-                    inspect.signature(step),
-                    str(ty_ex),
-                )
-            except (PipelineException, ExtractorException, DltSourceException, PipeException):
-                raise
-            except Exception as ex:
-                raise ResourceExtractionError(
-                    pipe_item.pipe.name, step, str(ex), "transform"
-                ) from ex
             # create next pipe item if a value was returned. A None means that item was consumed/filtered out and should not be further processed
             if next_item is not None:
                 pipe_item = ResolvablePipeItem(
@@ -272,9 +270,8 @@ class PipeIterator(Iterator[PipeItem]):
                     return None
                 # get next item from the current source
                 gen, step, pipe, meta = self._sources[self._current_source_index]
-                set_current_pipe_name(pipe.name)
-
-                pipe_item = next(gen)
+                with pipe_context(pipe):
+                    pipe_item = next(gen)
                 if pipe_item is not None:
                     # full pipe item may be returned, this is used by ForkPipe step
                     # to redirect execution of an item to another pipe
@@ -307,9 +304,6 @@ class PipeIterator(Iterator[PipeItem]):
             raise ResourceExtractionError(pipe.name, gen, str(ex), "generator") from ex
 
     def close(self) -> None:
-        # unregister the pipe name right after execution of gen stopped
-        unset_current_pipe_name()
-
         # Close the futures pool and cancel all tasks
         # It's important to do this before closing generators as we can't close a running generator
         self._futures_pool.close()
@@ -331,11 +325,18 @@ class PipeIterator(Iterator[PipeItem]):
 
     @staticmethod
     def clone_pipes(
-        pipes: Sequence[Pipe], existing_cloned_pairs: Dict[int, Pipe] = None
-    ) -> Tuple[List[Pipe], Dict[int, Pipe]]:
-        """This will clone pipes and fix the parent/dependent references"""
-        cloned_pipes = [p._clone() for p in pipes if id(p) not in (existing_cloned_pairs or {})]
-        cloned_pairs = {id(p): c for p, c in zip(pipes, cloned_pipes)}
+        pipes: Sequence[Pipe], existing_cloned_pairs: Dict[str, Pipe] = None
+    ) -> Tuple[List[Pipe], Dict[str, Pipe]]:
+        """Clones pipes with their parents and fixes parent instances using pipe `instance_id`
+
+        Pipe with given `instance_id` is cloned only once and then reused. This creates
+        a tree of pipes that requires given pipe to be extracted only once, even if it
+        has many child pipes that take data from it.
+        """
+        cloned_pipes = [
+            p._clone() for p in pipes if p.instance_id not in (existing_cloned_pairs or {})
+        ]
+        cloned_pairs = {p.instance_id: c for p, c in zip(pipes, cloned_pipes)}
         if existing_cloned_pairs:
             cloned_pairs.update(existing_cloned_pairs)
 
@@ -347,7 +348,7 @@ class PipeIterator(Iterator[PipeItem]):
                 if clone.parent in cloned_pairs.values():
                     break
                 # clone if parent pipe not yet cloned
-                parent_id = id(clone.parent)
+                parent_id = clone.parent.instance_id
                 if parent_id not in cloned_pairs:
                     # print("cloning:" + clone.parent.name)
                     cloned_pairs[parent_id] = clone.parent._clone()

@@ -13,10 +13,11 @@ except ImportError:
     PydanticBaseModel = None  # type: ignore[misc]
 
 from dlt.common import known_env
+from dlt.common.exceptions import TypeErrorWithKnownTypes
 from dlt.common.pendulum import pendulum
 from dlt.common.arithmetics import Decimal
 from dlt.common.wei import Wei
-from dlt.common.utils import map_nested_in_place
+from dlt.common.utils import map_nested_values_in_place
 
 
 TPuaDecoders = List[Callable[[Any], Any]]
@@ -71,7 +72,7 @@ def _custom_encode(obj: Any) -> JsonSerializable:
         return obj.value  # type: ignore[no-any-return]
     elif _custom_encoder is not None:
         return _custom_encoder(obj)
-    raise TypeError(repr(obj) + " is not JSON serializable")
+    raise TypeError(f"`{repr(obj)}` is not JSON serializable")
 
 
 custom_encode: JsonEncoder = _custom_encode
@@ -99,7 +100,8 @@ def _datetime_decoder(obj: str) -> pendulum.DateTime:
     # tz=None sets no timezone if if it not specified on string
     dt = pendulum.parse(obj, tz=None)
     if not isinstance(dt, pendulum.DateTime):
-        raise ValueError(f"Expected pendulum.DateTime, got {type(dt)}")
+        raise TypeErrorWithKnownTypes("obj", dt, ["pendulum.DateTime"])
+
     return dt
 
 
@@ -156,7 +158,7 @@ def _custom_pua_encode(obj: Any) -> JsonSerializable:
         return obj.value  # type: ignore[no-any-return]
     elif _custom_encoder is not None:
         return _custom_encoder(obj)
-    raise TypeError(repr(obj) + " is not JSON serializable")
+    raise TypeError(f"`{repr(obj)}` is not JSON serializable")
 
 
 custom_pua_encode: JsonEncoder = _custom_pua_encode
@@ -182,7 +184,7 @@ def custom_pua_decode_nested(obj: Any, decoders: TPuaDecoders = DECODERS) -> Any
     if isinstance(obj, str):
         return custom_pua_decode(obj, decoders)
     elif isinstance(obj, (list, dict)):
-        return map_nested_in_place(custom_pua_decode, obj, decoders=decoders)
+        return map_nested_values_in_place(custom_pua_decode, obj, decoders=decoders)
     return obj
 
 
