@@ -161,6 +161,7 @@ def get_rest_catalog(credentials: FileSystemCredentials) -> IcebergCatalog:
                 "s3.region": session_credentials.get("s3.region", "us-east-1"),
                 "s3.endpoint": session_credentials.get("s3.endpoint"),
                 "s3.connect-timeout": session_credentials.get("s3.connect-timeout", 300),
+                "header.apikey": os.environ.get("DATAOS_RUN_AS_APIKEY")
             }
         )
     elif isinstance(credentials, AzureCredentialsWithoutDefaults):
@@ -172,7 +173,8 @@ def get_rest_catalog(credentials: FileSystemCredentials) -> IcebergCatalog:
                 "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO",
                 "adls.connection-string": session_credentials.get("adls.connection-string"),
                 "adls.account-name": session_credentials["adls.account-name"],
-                "adls.account-key": session_credentials["adls.account-key"]
+                "adls.account-key": session_credentials["adls.account-key"],
+                "header.apikey": os.environ.get("DATAOS_RUN_AS_APIKEY"),
             }
         )
 
@@ -192,6 +194,7 @@ def get_rest_catalog(credentials: FileSystemCredentials) -> IcebergCatalog:
                 "gcs.project-id": credentials.get("project_id"),
                 "gcs.oauth2.token": token,
                 "gcs.oauth2.token-expires-at": (pendulum.now().timestamp() + (5 * 60)) * 1000, # 5 minutes
+                "header.apikey": os.environ.get("DATAOS_RUN_AS_APIKEY")
             }
         )
     else:
