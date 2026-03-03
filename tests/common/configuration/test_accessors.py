@@ -6,11 +6,7 @@ import dlt
 from dlt.common import json
 from dlt.common.configuration.exceptions import ConfigFieldMissingException
 
-from dlt.common.configuration.providers import (
-    EnvironProvider,
-    ConfigTomlProvider,
-    SecretsTomlProvider,
-)
+from dlt.common.configuration.providers import EnvironProvider
 from dlt.common.configuration.providers.toml import (
     CONFIG_TOML,
     SECRETS_TOML,
@@ -69,7 +65,7 @@ def test_getter_accessor(toml_providers: ConfigProvidersContainer, environment: 
         "str_val", "test string", None, AnyType, ["typecheck"], CONFIG_TOML, None
     )
 
-    environment["DLT__THIS__VALUE"] = "embedded"
+    environment["NILUS__THIS__VALUE"] = "embedded"
     assert dlt.config["dlt.this.value"] == "embedded"
     assert _resolved_traces()["dlt.this.value"] == ResolvedValueTrace(
         "value", "embedded", None, AnyType, ["dlt", "this"], EnvironProvider().name, None

@@ -1,34 +1,34 @@
 """Defines env variables that `dlt` uses independently of its configuration system"""
 
-DLT_PROJECT_DIR = "DLT_PROJECT_DIR"
+DLT_PROJECT_DIR = "NILUS_PROJECT_DIR"
 """The dlt project dir is the current working directory, '.' (current working dir) by default"""
 
-DLT_DATA_DIR = "DLT_DATA_DIR"
+DLT_DATA_DIR = "NILUS_DATA_DIR"
 """Sets default directory where pipelines' data (working directories) will be stored"""
 
-DLT_LOCAL_DIR = "DLT_LOCAL_DIR"
+DLT_LOCAL_DIR = "NILUS_LOCAL_DIR"
 """Sets a directory where local filesystem files are stored by destinations."""
 
-DLT_CONFIG_FOLDER = "DLT_CONFIG_FOLDER"
+DLT_CONFIG_FOLDER = "NILUS_CONFIG_FOLDER"
 """A folder (path relative to DLT_PROJECT_DIR) where config and secrets are stored"""
 
-DLT_DEFAULT_NAMING_NAMESPACE = "DLT_DEFAULT_NAMING_NAMESPACE"
+DLT_DEFAULT_NAMING_NAMESPACE = "NILUS_DEFAULT_NAMING_NAMESPACE"
 """Python namespace default where naming modules reside, defaults to dlt.common.normalizers.naming"""
 
-DLT_DEFAULT_NAMING_MODULE = "DLT_DEFAULT_NAMING_MODULE"
+DLT_DEFAULT_NAMING_MODULE = "NILUS_DEFAULT_NAMING_MODULE"
 """A module name with the default naming convention, defaults to snake_case"""
 
-DLT_DLT_ID_LENGTH_BYTES = "DLT_DLT_ID_LENGTH_BYTES"
+DLT_DLT_ID_LENGTH_BYTES = "NILUS_DLT_ID_LENGTH_BYTES"
 """The length of the _dlt_id identifier, before base64 encoding"""
 
-DLT_USE_JSON = "DLT_USE_JSON"
+DLT_USE_JSON = "NILUS_USE_JSON"
 """Type of json parser to use, defaults to orjson, may be simplejson"""
 
-DLT_JSON_TYPED_PUA_START = "DLT_JSON_TYPED_PUA_START"
+DLT_JSON_TYPED_PUA_START = "NILUS_JSON_TYPED_PUA_START"
 """Start of the unicode block within the PUA used to encode types in typed json"""
 
-DLT_PIP_TOOL = "DLT_PIP_TOOL"
+DLT_PIP_TOOL = "NILUS_PIP_TOOL"
 """Pip tool used to install deps in Venv"""
 
-DLT_DISABLE_PLUGINS = "DLT_DISABLE_PLUGINS"
-"""Disables detecting and instantiating plugins. Will speed up initial imports a little"""
+DLT_DISABLE_PLUGINS = "NILUS_DISABLE_PLUGINS"
+"""Disables detecting and instantiating plugins. Will speed up initial imports a little."""

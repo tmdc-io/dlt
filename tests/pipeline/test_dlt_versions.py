@@ -12,6 +12,7 @@ import dlt
 from dlt.common import json, pendulum
 from dlt.common.known_env import DLT_DATA_DIR
 from dlt.common.json import custom_pua_decode
+from dlt.common.normalizers.json.helpers import get_propagation_mapping
 from dlt.common.runners import Venv
 from dlt.common.storages.exceptions import StorageMigrationError
 from dlt.common.utils import custom_environ, set_working_dir
@@ -80,7 +81,7 @@ def test_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # save database outside of pipeline dir
             with custom_environ(
@@ -121,6 +122,12 @@ def test_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
                         github_schema["tables"]["issues"]["columns"]["assignee"]["data_type"]
                         == "complex"
                     )
+                    # make sure that root key propagation is enabled
+                    root_prop_config = github_schema["normalizers"]["json"]["config"][
+                        "propagation"
+                    ]["root"]
+                    assert root_prop_config["_dlt_id"] == "_dlt_root_id"
+
                     # check loads table without attaching to pipeline
                     duckdb_cfg = resolve_configuration(
                         DuckDbClientConfiguration()._bind_dataset_name(dataset_name=GITHUB_DATASET),
@@ -178,6 +185,10 @@ def test_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
                     github_schema["tables"]["issues"]["columns"]["assignee"]["data_type"] == "json"
                 )
                 assert "schema_version_hash" in github_schema["tables"][LOADS_TABLE_NAME]["columns"]
+                # root propagation dropped from normalizer config
+                norm_config = github_schema["normalizers"]["json"]["config"]
+                assert norm_config["root_key_propagation"] is True
+                assert "root" not in norm_config["propagation"]
                 # print(github_schema["tables"][PIPELINE_STATE_TABLE_NAME])
                 # load state
                 state_dict = json.loads(
@@ -251,7 +262,7 @@ def test_filesystem_with_gzip_extension_update(
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ(
             {
                 DLT_DATA_DIR: dlt.current.run_context().data_dir,
@@ -321,7 +332,7 @@ def test_filesystem_pipeline_with_dlt_update(test_storage: FileStorage) -> None:
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # create virtual env with (0.4.9) where filesystem started to store state
             with Venv.create(tempfile.mkdtemp(), ["dlt==0.4.9"]) as venv:
@@ -395,7 +406,7 @@ def test_load_package_with_dlt_update(test_storage: FileStorage) -> None:
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # save database outside of pipeline dir
             with custom_environ(
@@ -472,7 +483,7 @@ def test_normalize_package_with_dlt_update(test_storage: FileStorage) -> None:
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # save database outside of pipeline dir
             with custom_environ(
@@ -509,7 +520,7 @@ def test_scd2_pipeline_update(test_storage: FileStorage) -> None:
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # save database outside of pipeline dir
             with custom_environ(
@@ -588,6 +599,16 @@ def test_scd2_pipeline_update(test_storage: FileStorage) -> None:
 
                 assert len(issues_retired) == 1
                 assert issues_retired[0][0] == 6272
+                # root propagation is still there
+                normalizer_config = (
+                    pipeline.default_schema.data_item_normalizer.get_normalizer_config(
+                        pipeline.default_schema
+                    )
+                )
+                propagation = get_propagation_mapping(
+                    normalizer_config["propagation"], "issues", is_root=True
+                )
+                assert propagation == {"_dlt_id": "_dlt_root_id"}
                 # print(pipeline.default_schema.to_pretty_yaml())
 
 
@@ -599,7 +620,7 @@ def test_normalize_path_separator_legacy_behavior(test_storage: FileStorage) -> 
 
     # execute in test storage
     with set_working_dir(TEST_STORAGE_ROOT):
-        # store dlt data in test storage (like patch_home_dir)
+        # store dlt data in test storage (like create_test_run_context)
         with custom_environ({DLT_DATA_DIR: dlt.current.run_context().data_dir}):
             # save database outside of pipeline dir
             with custom_environ(

@@ -25,6 +25,7 @@ from dlt.common.libs.pyarrow import (
     is_arrow_item,
     remove_null_columns_from_schema,
     UnsupportedArrowTypeException,
+    cast_date64_columns_to_timestamp,
 )
 from dlt.common.destination import DestinationCapabilitiesContext
 from tests.cases import table_update_and_row
@@ -493,3 +494,51 @@ def test_fill_empty_source_column_values_with_placeholder() -> None:
     ]
     expected_table = pa.Table.from_arrays(expected_data, names=["A", "B", "C", "D"])
     assert new_table.equals(expected_table)
+
+
+def test_cast_date64_columns_to_timestamp_rescales_ms_to_us() -> None:
+    # Prepare date64[ms] values and verify ms -> us rescaling.
+    ms_values = [0, 1001, 1609459200123, 1609459200456, None]
+    date64_arr = pa.array(ms_values, type=pa.date64())
+    tbl = pa.table({"ts_like": date64_arr})
+
+    # Rescale date64[ms] -> timestamp[us] (naive)
+    out = cast_date64_columns_to_timestamp(tbl)
+
+    assert pa.types.is_timestamp(out["ts_like"].type)
+    assert out["ts_like"].type == pa.timestamp("us")
+    expected_us = pa.array(
+        [0, 1001000, 1609459200123000, 1609459200456000, None],
+        type=pa.timestamp("us"),
+    )
+    assert out["ts_like"].equals(pa.chunked_array([expected_us]))
+    micros = pa.compute.cast(out["ts_like"], pa.int64()).combine_chunks()
+    assert micros[3].as_py() == 1609459200456000
+
+
+def test_cast_date64_is_noop_when_absent_and_returns_same_object() -> None:
+    # Table without date64 columns should be returned unchanged (same object)
+    tbl = pa.table({"a": pa.array([1, 2, None]), "b": pa.array(["x", "y", "z"])})
+    out = cast_date64_columns_to_timestamp(tbl)
+    assert out is tbl
+
+
+def test_cast_date64_chunked_array_support() -> None:
+    # Build a chunked date64 column with millisecond values
+    vals1 = pa.array([0, 1001, 2002], type=pa.date64())
+    vals2 = pa.array([1609459200123, None], type=pa.date64())
+    date64_chunked = pa.chunked_array([vals1, vals2])
+    tbl = pa.table({"ts_like": date64_chunked})
+
+    out = cast_date64_columns_to_timestamp(tbl)
+
+    # Should be timestamp[us] chunked array with ms -> us rescaling
+    assert pa.types.is_timestamp(out["ts_like"].type)
+    assert out["ts_like"].type == pa.timestamp("us")
+    expected = pa.chunked_array(
+        [
+            pa.array([0, 1001000, 2002000], type=pa.timestamp("us")),
+            pa.array([1609459200123000, None], type=pa.timestamp("us")),
+        ]
+    )
+    assert out["ts_like"].equals(expected)

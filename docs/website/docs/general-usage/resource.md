@@ -184,8 +184,40 @@ def get_users():
     ...
 ```
 
-`"skip_nested_types"` omits any `dict`/`list`/`BaseModel` type fields from the schema, so dlt will fall back on the default
-behavior of creating nested tables for these fields.
+The following `DltConfig` options are available:
+
+- `"skip_nested_types"`: Omits any `dict`/`list`/`BaseModel` type fields from the schema, so dlt will fall back on the default behavior of creating nested tables for these fields.
+
+- `"return_validated_models"`: By default, when using a Pydantic model for validation, dlt converts the validated model instances to dictionaries before passing them downstream (e.g., to transformers). If you set this option to `True`, dlt will return the validated Pydantic model instances instead. This is useful when you want to work with Pydantic models in transformers without having to reconstruct them from dictionaries.
+
+Example with `return_validated_models`:
+
+```py
+from typing import ClassVar
+from pydantic import BaseModel
+from dlt.common.libs.pydantic import DltConfig
+import dlt
+
+class SimpleUser(BaseModel):
+    id: int
+    name: str
+    dlt_config: ClassVar[DltConfig] = {"return_validated_models": True}
+
+@dlt.resource(columns=User)
+def simple_users():
+    yield {"id": 1, "name": "Alice"}
+    yield SimpleUser(id=2, name="Bob")
+
+@dlt.transformer(data_from=simple_users)
+def process_users(user: SimpleUser):
+    # user is a Pydantic model instance, not a dict
+    print(f"Processing user: {user.name}")
+    yield user
+
+# Transformers receive User model instances directly
+pipeline = dlt.pipeline(destination="duckdb")
+pipeline.run(process_users)
+```
 
 We do not support `RootModel` that validate simple types. You can add such a validator yourself, see [data filtering section](#filter-transform-and-pivot-data).
 
@@ -354,12 +386,14 @@ resource. The available transformation types:
 - **filter** - filter the data item (`resource.add_filter`).
 - [**yield map**](../dlt-ecosystem/transformations/add-map#add_yield_map) - a map that returns an iterator (so a single row may generate many rows -
   `resource.add_yield_map`).
+- [**metrics**](#using-add_metrics-as-a-transformation-step) - collect custom metrics without modifying data items (`resource.add_metrics`).
 
 Example: We have a resource that loads a list of users from an API endpoint. We want to customize it
 so:
 
-1. We remove users with `user_id == "me"`.
-2. We anonymize user data.
+1. We track how many users with `user_id == "me"` are being filtered out.
+2. We remove users with `user_id == "me"`.
+3. We anonymize user data.
 
 Here's our resource:
 
@@ -384,8 +418,20 @@ def anonymize_user(user_data):
     user_data["user_email"] = _hash_str(user_data["user_email"])
     return user_data
 
-# add the filter and anonymize function to users resource and enumerate
-for user in users().add_filter(lambda user: user["user_id"] != "me").add_map(anonymize_user):
+def track_filtered(items, meta, metrics):
+    """Track how many 'me' users were filtered out."""
+    users_list = items if isinstance(items, list) else [items]
+    for user in users_list:
+        if user["user_id"] == "me":
+            metrics["filtered_me_users"] = metrics.get("filtered_me_users", 0) + 1
+
+# add metrics, filter, and anonymize function to users resource
+for user in (
+    users()
+    .add_metrics(track_filtered)
+    .add_filter(lambda user: user["user_id"] != "me")
+    .add_map(anonymize_user)
+):
     print(user)
 ```
 
@@ -440,7 +486,7 @@ resource.max_table_nesting = 0
 ```
 
 Several data sources are prone to contain semi-structured documents with very deep nesting, i.e.,
-MongoDB databases. Our practical experience is that setting the `max_nesting_level` to 2 or 3
+MongoDB databases. Our practical experience is that setting the `max_table_nesting` to 2 or 3
 produces the clearest and human-readable schemas.
 
 ### Sample from large data
@@ -465,10 +511,18 @@ def my_resource():
 
 dlt.pipeline(destination="duckdb").run(my_resource().add_limit(10))
 ```
-The code above will extract `15*10=150` records. This is happening because in each iteration, 15 records are yielded, and we're limiting the number of iterations to 10.
+The code above will extract `15*10=150` records. This is happening because in each iteration, 15 records are yielded, and we're limiting the number of iterations to 10. In this mode `add_limit` also counts empty batches/pages.
+
+If you wish to count rows instead:
+```py
+dlt.pipeline(destination="duckdb").run(my_resource().add_limit(10, count_rows=True))
+```
+In this mode `add_limit` skips empty pages as they contain no rows.
+Note that `dlt` will still process full pages/yields of data. They won't be trimmed even if large so your effective count will probably
+be different from limit that you set.
 :::
 
-Altenatively you can also apply a time limit to the resource. The code below will run the extraction for 10 seconds and extract how ever many items are yielded in that time. In combination with incrementals, this can be useful for batched loading or for loading on machines that have a run time limit.
+Alternatively you can also apply a time limit to the resource. The code below will run the extraction for 10 seconds and extract how ever many items are yielded in that time. In combination with incrementals, this can be useful for batched loading or for loading on machines that have a run time limit.
 
 ```py
 dlt.pipeline(destination="duckdb").run(my_resource().add_limit(max_time=10))
@@ -479,7 +533,6 @@ You can also apply a combination of both limits. In this case the extraction wil
 ```py
 dlt.pipeline(destination="duckdb").run(my_resource().add_limit(max_items=10, max_time=10))
 ```
-
 
 Some notes about the `add_limit`:
 
@@ -693,6 +746,102 @@ pipeline.run(
 
 The `with_name` method returns a deep copy of the original resource, its data pipe, and the data pipes of a parent resource. A renamed clone is fully separated from the original resource (and other clones) when loading: it maintains a separate [resource state](state.md#read-and-write-pipeline-state-in-a-resource) and will load to a table.
 
+## Collect custom metrics
+
+
+### Using `dlt.current.resource_metrics()` within a resource
+
+You can track custom statistics during resource extraction with `dlt.current.resource_metrics()`, which might otherwise be lost:
+
+```py
+import dlt
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
+
+github_client = RESTClient(
+    base_url="https://pokeapi.co/api/v2",
+    paginator=JSONLinkPaginator(next_url_path="next"),
+    data_selector="results",
+)
+
+@dlt.resource
+def get_pokemons():
+    custom_metrics = dlt.current.resource_metrics()
+    custom_metrics["page_count"] = 0
+    for page in github_client.paginate(
+        "/pokemon",
+        params={
+            "limit": 100,
+        },
+    ):
+        custom_metrics["page_count"] += 1
+        yield page
+
+pipeline = dlt.pipeline(
+    pipeline_name="get_pokemons",
+    destination="duckdb",
+    dataset_name="github_data",
+)
+load_info = pipeline.run(get_pokemons)
+print(load_info)
+
+# Access custom metrics from last trace
+trace = pipeline.last_trace
+load_id = load_info.loads_ids[0]
+resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]
+
+print(f"Custom metrics: {resource_metrics.custom_metrics}")
+```
+
+As shown above, custom metrics are included in pipeline traces. Refer to [pipeline trace loading](../running-in-production/running.md#inspect-and-save-the-load-info-and-trace) for more details.
+
+### Using `add_metrics` as a transformation step
+
+Alternatively, you can collect metrics using `add_metrics`, which works as a transformation step in the pipeline.
+
+```py
+import dlt
+from dlt.sources.helpers.rest_client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import JSONLinkPaginator
+
+github_client = RESTClient(
+    base_url="https://pokeapi.co/api/v2",
+    paginator=JSONLinkPaginator(next_url_path="next"),
+    data_selector="results",
+)
+
+@dlt.resource
+def get_pokemons():
+    for page in github_client.paginate(
+        "/pokemon",
+        params={
+            "limit": 100,
+        },
+    ):
+        yield page
+
+def page_counter(items, meta, metrics) -> None:
+    metrics["page_count"] = metrics.get("page_count", 0) + 1
+
+get_pokemons.add_metrics(page_counter)
+
+pipeline = dlt.pipeline(
+    pipeline_name="get_pokemons",
+    destination="duckdb",
+    dataset_name="github_data",
+)
+load_info = pipeline.run(get_pokemons)
+print(load_info)
+
+# Access custom metrics from last trace
+trace = pipeline.last_trace
+load_id = load_info.loads_ids[0]
+resource_metrics = trace.last_extract_info.metrics[load_id][0]["resource_metrics"]["get_pokemons"]
+
+print(f"Custom metrics: {resource_metrics.custom_metrics}")
+```
+
+
 ## Load resources
 
 You can pass individual resources or a list of resources to the `dlt.pipeline` object. The resources loaded outside the source context will be added to the [default schema](schema.md) of the pipeline.
@@ -743,4 +892,3 @@ You can also [fully drop the tables](pipeline.md#refresh-pipeline-data-and-state
 ```py
 p.run(merge_source(), refresh="drop_sources")
 ```
-

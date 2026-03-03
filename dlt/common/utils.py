@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Any, Literal
+import re
+from typing import TYPE_CHECKING, Any, BinaryIO, IO
 import os
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ from os import environ
 from types import ModuleType
 import traceback
 import zlib
+import tarfile
 from importlib.metadata import version as pkg_version
 from packaging.version import Version
 
@@ -26,6 +28,7 @@ from typing import (
     Dict,
     MutableMapping,
     Iterator,
+    Generator,
     Optional,
     Sequence,
     Set,
@@ -48,6 +51,7 @@ from dlt.common.exceptions import (
     ValueErrorWithKnownValues,
 )
 from dlt.common.typing import AnyFun, StrAny, DictStrAny, StrStr, TAny, TFun, Generic
+from dlt.common.warnings import Dlt100DeprecationWarning, deprecated
 
 
 T = TypeVar("T")
@@ -117,6 +121,62 @@ def digest256(v: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def digest256_file_stream(stream: BinaryIO, chunk_size: int = 4096) -> str:
+    """Returns a base64 encoded sha3_256 hash of a binary stream"""
+    stream.seek(0)
+    hash_obj = hashlib.sha3_256()
+    while chunk := stream.read(chunk_size):
+        hash_obj.update(chunk)
+    digest = hash_obj.digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def digest256_tar_stream(
+    stream: IO[bytes],
+    filter_file_names: Callable[[str], bool] = lambda x: True,
+    chunk_size: int = 8192,
+) -> Tuple[str, List[str]]:
+    """Calculates hash and collects file names from tar archive in a single pass.
+
+    Hashes only file names and file contents of filtered members, ignoring timestamps
+    and other tar metadata. Members are sorted by name before hashing for consistency.
+    Operates entirely in-memory to prevent leakage of sensitive data.
+
+    Args:
+        stream: Binary stream containing the tar archive
+        filter_file_names: Callable that returns True for members to include in hash
+            and file names list. Default includes all members. Use this to exclude
+            metadata files (e.g., manifest.yaml) from the hash calculation.
+        chunk_size: Size of chunks to read when hashing file contents. Default 8192.
+
+    Returns:
+        tuple: (content_hash, file_names)
+    """
+    stream.seek(0)
+    hash_obj = hashlib.sha3_256()
+    file_names = []
+
+    with tarfile.open(fileobj=stream, mode="r:*") as tar:
+        members = sorted(tar.getmembers(), key=lambda m: m.name)
+
+        for member in members:
+            if not filter_file_names(member.name):
+                continue
+
+            hash_obj.update(member.name.encode())
+            if member.isfile():
+                file_names.append(member.name)
+                f = tar.extractfile(member)
+                if f:
+                    while chunk := f.read(chunk_size):
+                        hash_obj.update(chunk)
+
+    digest = hash_obj.digest()
+    content_hash = base64.b64encode(digest).decode("ascii")
+
+    return content_hash, file_names
+
+
 def str2bool(v: str) -> bool:
     if isinstance(v, bool):
         return v
@@ -162,7 +222,9 @@ def flatten_list_of_str_or_dicts(seq: Sequence[Union[StrAny, str]]) -> DictStrAn
     return o
 
 
-def flatten_list_or_items(_iter: Union[Iterable[TAny], Iterable[List[TAny]]]) -> Iterator[TAny]:
+def flatten_list_or_items(
+    _iter: Union[Iterable[TAny], Iterable[List[TAny]]]
+) -> Generator[TAny, None, None]:
     for items in _iter:
         if isinstance(items, List):
             yield from items
@@ -327,8 +389,9 @@ def map_nested_values_in_place(
 
 
 # keep old name for backwards compatibility
-# dlt+ needs to be updated
-map_nested_in_place = map_nested_values_in_place
+map_nested_in_place = deprecated(
+    "Use `map_nested_values_in_place` instead.", category=Dlt100DeprecationWarning
+)(map_nested_values_in_place)
 
 
 def map_nested_keys_in_place(
@@ -627,6 +690,8 @@ def get_exception_trace(exc: BaseException) -> ExceptionTrace:
                 from dlt.common.json import json
 
                 # must be json serializable, other attrs are skipped
+                # TODO: be more picky re. what is serialized. exceptions contain data items and
+                #  other value that should not be serialized
                 if not isinstance(v, str):
                     json.dumps(v)
                 str_attrs[k] = v

@@ -93,10 +93,13 @@ class RedshiftCopyFileLoadJob(CopyRemoteFileLoadJob):
         ):
             aws_access_key = self._staging_credentials.aws_access_key_id
             aws_secret_key = self._staging_credentials.aws_secret_access_key
+            aws_session_token = self._staging_credentials.aws_session_token
             credentials = (
                 "CREDENTIALS"
                 f" 'aws_access_key_id={aws_access_key};aws_secret_access_key={aws_secret_key}'"
             )
+            if aws_session_token:
+                credentials = credentials[:-1] + f";token={aws_session_token}'"
         # get format
         file_format, is_compressed = get_file_format_and_compression(self._bucket_path)
         file_type = ""
@@ -167,9 +170,12 @@ class RedshiftClient(InsertValuesJobClient, SupportsStagingDestination):
         config: RedshiftClientConfiguration,
         capabilities: DestinationCapabilitiesContext,
     ) -> None:
+        dataset_name, staging_dataset_name = InsertValuesJobClient.create_dataset_names(
+            schema, config
+        )
         sql_client = RedshiftSqlClient(
-            config.normalize_dataset_name(schema),
-            config.normalize_staging_dataset_name(schema),
+            dataset_name,
+            staging_dataset_name,
             config.credentials,
             capabilities,
         )

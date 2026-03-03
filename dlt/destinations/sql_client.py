@@ -20,6 +20,7 @@ from typing import (
     cast,
 )
 
+from dlt.common.destination.exceptions import DestinationUndefinedEntity
 from dlt.common.typing import TFun, TypedDict, Self
 from dlt.common.schema.typing import TTableSchemaColumns
 from dlt.common.destination import DestinationCapabilitiesContext
@@ -108,9 +109,9 @@ class SqlClientBase(ABC, Generic[TNativeConn]):
         pass
 
     def has_dataset(self) -> bool:
-        query = """
+        query = f"""
 SELECT 1
-    FROM INFORMATION_SCHEMA.SCHEMATA
+    FROM {self._qualify_info_schema_table_name("SCHEMATA")}
     WHERE """
         catalog_name, schema_name, _ = self._get_information_schema_components()
         db_params: List[str] = []
@@ -126,6 +127,7 @@ SELECT 1
         self.execute_sql("CREATE SCHEMA %s" % self.fully_qualified_dataset_name())
 
     def drop_dataset(self) -> None:
+        # assert self.fully_qualified_dataset_name() != "None"
         self.execute_sql("DROP SCHEMA %s CASCADE" % self.fully_qualified_dataset_name())
 
     def truncate_tables(self, *tables: str) -> None:
@@ -307,6 +309,9 @@ SELECT 1
         mro = type.mro(type(ex))
         return any(t.__name__ in ("DatabaseError", "DataError") for t in mro)
 
+    def _qualify_info_schema_table_name(self, table_name: str) -> str:
+        return f"INFORMATION_SCHEMA.{table_name}"
+
     def _get_information_schema_components(self, *tables: str) -> Tuple[str, str, List[str]]:
         """Gets catalog name, schema name and name of the tables in format that can be directly
         used to query INFORMATION_SCHEMA. catalog name is optional: in that case None is
@@ -446,7 +451,10 @@ def raise_database_error(f: TFun) -> TFun:
             return (yield from f(self, *args, **kwargs))
         except Exception as ex:
             db_ex = self._make_database_exception(ex)
-            raise db_ex.with_traceback(ex.__traceback__) from ex
+            if db_ex is ex:
+                raise db_ex.with_traceback(ex.__traceback__)
+            else:
+                raise db_ex.with_traceback(ex.__traceback__) from ex
 
     @wraps(f)
     def _wrap(self: SqlClientBase[Any], *args: Any, **kwargs: Any) -> Any:
@@ -454,7 +462,10 @@ def raise_database_error(f: TFun) -> TFun:
             return f(self, *args, **kwargs)
         except Exception as ex:
             db_ex = self._make_database_exception(ex)
-            raise db_ex.with_traceback(ex.__traceback__) from ex
+            if db_ex is ex:
+                raise db_ex.with_traceback(ex.__traceback__)
+            else:
+                raise db_ex.with_traceback(ex.__traceback__) from ex
 
     if inspect.isgeneratorfunction(f):
         return _wrap_gen  # type: ignore[return-value]
@@ -467,6 +478,12 @@ def raise_open_connection_error(f: TFun) -> TFun:
         try:
             return f(self, *args, **kwargs)
         except Exception as ex:
+            db_ex = self._make_database_exception(ex)
+            if isinstance(db_ex, DestinationUndefinedEntity):
+                if db_ex is ex:
+                    raise db_ex.with_traceback(ex.__traceback__)
+                else:
+                    raise db_ex.with_traceback(ex.__traceback__) from ex
             raise DestinationConnectionError(type(self).__name__, self.dataset_name, str(ex), ex)
 
     return _wrap  # type: ignore

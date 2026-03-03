@@ -15,6 +15,7 @@ from typing import (
     cast,
     Any,
     Dict,
+    TYPE_CHECKING,
 )
 from fsspec import AbstractFileSystem
 
@@ -35,7 +36,7 @@ from dlt.common.storages.exceptions import (
 )
 from dlt.common.storages.fsspec_filesystem import glob_files
 from dlt.common.time import ensure_pendulum_datetime_utc
-from dlt.common.typing import DictStrAny
+from dlt.common.typing import ConfigValue, DictStrAny
 from dlt.common.schema import Schema, TSchemaTables
 from dlt.common.schema.utils import get_columns_names_with_prop
 from dlt.common.storages import FileStorage, fsspec_from_config
@@ -66,7 +67,7 @@ from dlt.common.destination.exceptions import (
     OpenTableCatalogNotSupported,
     OpenTableFormatNotSupported,
 )
-
+from dlt.common.schema.exceptions import SchemaCorruptedException
 from dlt.destinations.job_impl import (
     ReferenceFollowupJobRequest,
     FinalizedLoadJob,
@@ -79,6 +80,9 @@ from dlt.destinations.utils import (
     verify_schema_merge_disposition,
     verify_schema_replace_disposition,
 )
+
+if TYPE_CHECKING:
+    from dlt.destinations.impl.filesystem.iceberg_adapter import PartitionSpec
 
 CURRENT_VERSION: int = 2
 SUPPORTED_VERSIONS: set[int] = {1, CURRENT_VERSION}
@@ -101,7 +105,6 @@ class FilesystemLoadJob(RunnableLoadJob):
         # deeply nested directory will not exist before writing a file.
         # It `auto_mkdir` is disabled by default in fsspec so we made some
         # trade offs between different options and decided on this.
-        # remote_path = f"{client.config.protocol}://{posixpath.join(dataset_path, destination_file_name)}"
         remote_path = self.make_remote_path()
         if (
             not self._job_client.config.as_staging_destination
@@ -147,6 +150,9 @@ class FilesystemLoadJob(RunnableLoadJob):
 
     def metrics(self) -> Optional[LoadJobMetrics]:
         m = super().metrics()
+        # job client not available before run_managed called
+        if not self._job_client:
+            return m
         return m._replace(remote_url=self.make_remote_url())
 
 
@@ -224,7 +230,14 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
 
 class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
-        from dlt.common.libs.pyiceberg import write_iceberg_table, merge_iceberg_table, create_table, extract_partition_specs_from_schema
+        from dlt.common.libs.pyiceberg import (
+            write_iceberg_table,
+            merge_iceberg_table,
+            create_table,
+        )
+        from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
+            build_iceberg_partition_spec,
+        )
 
         try:
             table = self._job_client.load_open_table(
@@ -236,25 +249,26 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             location = self._job_client.get_open_table_location("iceberg", self.load_table_name)
             table_id = f"{self._job_client.dataset_name}.{self.load_table_name}"
 
-            # Extract partition specifications from table schema
-            partition_specs = extract_partition_specs_from_schema(self._load_table, self.arrow_dataset.schema)
+            spec_list = self._get_partition_spec_list()
 
-            # Priority system: if advanced partitioning exists, ignore legacy partitioning
-            if partition_specs:
-                # Advanced partitioning detected - use partition_specs
-                legacy_columns = None
+            if spec_list:
+                partition_spec, iceberg_schema = build_iceberg_partition_spec(
+                    self.arrow_dataset.schema, spec_list
+                )
+                create_table(
+                    self._job_client.get_open_table_catalog("iceberg"),
+                    table_id,
+                    table_location=location,
+                    schema=iceberg_schema,
+                    partition_spec=partition_spec,
+                )
             else:
-                # No advanced partitioning - fall back to legacy partition_columns
-                legacy_columns = self._partition_columns
-
-            create_table(
-                self._job_client.get_open_table_catalog("iceberg"),
-                table_id,
-                table_location=location,
-                schema=self.arrow_dataset.schema,
-                partition_columns=legacy_columns,  # Legacy partitioning when no advanced
-                partition_specs=partition_specs,  # Advanced partitioning when present
-            )
+                create_table(
+                    self._job_client.get_open_table_catalog("iceberg"),
+                    table_id,
+                    table_location=location,
+                    schema=self.arrow_dataset.schema,
+                )
             # run again with created table
             self.run()
             return
@@ -272,6 +286,30 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                 data=self.arrow_dataset.to_table(),
                 write_disposition=self._load_table["write_disposition"],
             )
+
+    def _get_partition_spec_list(self) -> List["PartitionSpec"]:
+        """Resolve partition specs. Combines legacy partition columns (identity transform)
+        with partition hints. Validates that identity partitions are not duplicated.
+        """
+        from dlt.destinations.impl.filesystem.iceberg_adapter import (
+            parse_partition_hints,
+            create_identity_specs,
+        )
+
+        legacy_columns = self._partition_columns
+
+        hint_specs = parse_partition_hints(self._load_table)
+
+        for spec in hint_specs:
+            if spec.transform == "identity" and spec.source_column in legacy_columns:
+                raise SchemaCorruptedException(
+                    self._schema.name,
+                    f"Column '{spec.source_column}' is defined both as a partition column "
+                    "and in partition hints.",
+                )
+
+        identity_specs = create_identity_specs(legacy_columns)
+        return identity_specs + hint_specs
 
 
 class FilesystemLoadJobWithFollowup(HasFollowupJobs, FilesystemLoadJob):
@@ -377,7 +415,7 @@ class FilesystemClient(
     def with_staging_dataset(self) -> Iterator["FilesystemClient"]:
         current_dataset_name = self.dataset_name
         try:
-            self.dataset_name = self.config.normalize_staging_dataset_name(self.schema)
+            _, self.dataset_name = WithStagingDataset.create_dataset_names(self.schema, self.config)
             yield self
         finally:
             # restore previous dataset name
@@ -523,11 +561,35 @@ class FilesystemClient(
         try:
             # NOTE: must use rm_file to get errors on delete
             self.fs_client.rm_file(file_path)
-        except NotImplementedError:
-            # not all filesystems implement the above
-            self.fs_client.rm(file_path)
-            if self.fs_client.exists(file_path):
-                raise FileExistsError(file_path)
+        except FileNotFoundError:
+            # File doesn't exist - deletion goal already achieved
+            return
+        except Exception as e:
+            # OneLake API quirk: returns HTTP 200 instead of HTTP 202 for delete operations
+            # Azure SDK treats this as an error, but the delete actually succeeded
+            if "Operation returned an invalid status 'OK'" in str(e):
+                # Verify deletion succeeded by checking if file still exists
+                if not self.fs_client.exists(file_path):
+                    return  # Delete succeeded despite the error
+            # If it's NotImplementedError, try the fallback rm() method
+            if isinstance(e, NotImplementedError):
+                try:
+                    self.fs_client.rm(file_path)
+                except FileNotFoundError:
+                    # File doesn't exist - deletion goal already achieved
+                    return
+                except Exception as rm_e:
+                    # OneLake API quirk: returns HTTP 200 instead of HTTP 202 for delete operations
+                    # Azure SDK treats this as an error, but the delete actually succeeded
+                    if "Operation returned an invalid status 'OK'" in str(rm_e):
+                        # Verify deletion succeeded by checking if file still exists
+                        if not self.fs_client.exists(file_path):
+                            return  # Delete succeeded despite the error
+                    raise
+                if self.fs_client.exists(file_path):
+                    raise FileExistsError(file_path)
+            else:
+                raise
 
     def verify_schema(
         self, only_tables: Iterable[str] = None, new_jobs: Iterable[ParsedLoadJobFileName] = None
@@ -744,7 +806,9 @@ class FilesystemClient(
                 raise DestinationUndefinedEntity(table_name)
         for filepath in all_files:
             filename = os.path.splitext(os.path.basename(filepath))[0]
-            fileparts = filename.split(FILENAME_SEPARATOR)
+            fileparts = filename.rsplit(
+                FILENAME_SEPARATOR, maxsplit=2
+            )  # name, load_id, version_hash
             if len(fileparts) != 3:
                 continue
             # Filters only if pipeline_name provided
@@ -1000,8 +1064,10 @@ class FilesystemClient(
                 f"Can't load tables using `{table_format=:}` with `filesystem` destination."
             )
 
-    def get_open_table_catalog(self, table_format: TTableFormat, catalog_name: str = None) -> Any:
-        """Gets a native catalog for a table `table_name` with format `table_format`
+    def get_open_table_catalog(
+        self, table_format: TTableFormat, catalog_name: Optional[str] = None
+    ) -> Any:
+        """Gets a native catalog for a table with format `table_format`
 
         Returns: currently pyiceberg Catalog is supported
         """
@@ -1011,18 +1077,25 @@ class FilesystemClient(
         if self._catalog:
             return self._catalog
 
-        from dlt.common.libs.pyiceberg import get_sql_catalog, IcebergCatalog, get_rest_catalog
+        from dlt.common.libs.pyiceberg import get_catalog, IcebergCatalog
+        from pyiceberg.exceptions import NamespaceAlreadyExistsError
 
-        # create in-memory catalog
-        # catalog: IcebergCatalog
-        # catalog = self._catalog = get_sql_catalog(
-        #     catalog_name or "default", "sqlite:///:memory:", self.config.credentials)
-        # create rest-catalog
-        catalog: IcebergCatalog = get_rest_catalog(
-            self.config.credentials)
+        catalog: IcebergCatalog
 
-        # create namespace
-        catalog.create_namespace_if_not_exists(self.dataset_name)
+        # Try to load catalog using new function
+        catalog = self._catalog = get_catalog(
+            iceberg_catalog_name=catalog_name or ConfigValue,
+            credentials=self.config.credentials,
+        )
+
+        logger.info(f"Successfully loaded catalog '{catalog.name}' ")
+
+        # Create namespace
+        try:
+            catalog.create_namespace(self.dataset_name)
+            logger.info(f"Created Iceberg namespace: {self.dataset_name}")
+        except NamespaceAlreadyExistsError as e:
+            logger.debug(f"Namespace {self.dataset_name} already exists or error: {e}")
 
         return catalog
 

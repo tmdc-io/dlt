@@ -43,7 +43,7 @@ def test_dbt_commands(test_storage: FileStorage) -> None:
 
     # extract postgres creds from env, parse and emit
     credentials = resolve_configuration(PostgresCredentials(), sections=("destination", "postgres"))
-    add_config_to_env(credentials, ("dlt",))
+    add_config_to_env(credentials, ("nilus",))
 
     repo_path = clone_jaffle_repo(test_storage)
     # copy profile

@@ -70,7 +70,7 @@ To retain the original naming convention (like keeping `"createdAt"` as it is in
 [schema]
 naming="direct"
 ```
-:::caution
+:::warning
 Opting for `"direct"` naming bypasses most name normalization processes. This means any unusual characters present will be carried over unchanged to database tables and columns. Please be aware of this behavior to avoid potential issues.
 :::
 
@@ -208,7 +208,7 @@ explicitly on a column or by a source/resource. Normalizers do not infer this hi
 | tz-aware        | `False`         | to UTC and then naive |
 |                 |                 |                       |
 
-:::caution
+:::warning
 naive timestamps will **always be considered as UTC**, system timezone settings are ignored by `dlt`
 :::
 
@@ -532,7 +532,7 @@ all the settings to default.
 
 ### Automatically load schema file stored with source python module
 
-If no schema instance is passed, and a file with a name `{source name}_schema.yml` exists in the
+If no schema instance is passed, and a file with a name `{source name}.schema.yaml` exists in the
 same folder as the module with the decorated function, it will be automatically loaded and used as
 the schema.
 

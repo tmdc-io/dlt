@@ -85,7 +85,7 @@ json.set_custom_encoder(my_custom_encoder)
 
 You can switch to **simplejson** at any moment by (1) removing the **orjson** dependency or (2) setting the following env variable:
 ```sh
-DLT_USE_JSON=simplejson
+NILUS_USE_JSON=simplejson
 ```
 :::
 
@@ -186,7 +186,7 @@ You can control the number of async functions/awaitables being evaluated in para
 of callables to be evaluated in a thread pool with a size of 5. This limit will instantiate only the desired amount of workers.
 :::
 
-:::caution
+:::warning
 Generators and iterators are always evaluated in a single thread: item by item. If you have a loop that yields items that you want to evaluate
 in parallel, instead yield functions or async functions that will be evaluated in separate threads or in an async pool.
 :::
@@ -204,7 +204,7 @@ The default is to not parallelize normalization and to perform it in the main pr
 Normalization is CPU-bound and can easily saturate all your cores. Never allow `dlt` to use all cores on your local machine.
 :::
 
-:::caution
+:::warning
 The default method of spawning a process pool on Linux is **fork**. If you are using threads in your code (or libraries that use threads),
 you should switch to **spawn**. Process forking does not respawn the threads and may destroy the critical sections in your code. Even logging
 with Python loggers from multiple threads may lock the `normalize` step. Here's how you switch to **spawn**:
@@ -293,6 +293,7 @@ Please note the following:
 process start method.
 2. If you created the `Pipeline` object in the worker thread and you use it from another (i.e., the main thread),
 call `pipeline.activate()` to inject the right context into the current thread.
+3. Note how `with signals.intercepted_signals():` was used to [enable graceful shutdown](../running-in-production/running.md#allow-a-graceful-shutdown) of pipelines running in a thread pool.
 :::
 
 
@@ -342,12 +343,12 @@ volumes {
 ```
 ## Handling storage limits
 
-If your storage reaches its limit, you are likely running dlt in a cloud environment with restricted disk space. To prevent issues, mount an external cloud storage location and set the `DLT_DATA_DIR` environment variable to point to it. This ensures that dlt uses the mounted storage as its data directory instead of local disk space.
+If your storage reaches its limit, you are likely running dlt in a cloud environment with restricted disk space. To prevent issues, mount an external cloud storage location and set the `NILUS_DATA_DIR` environment variable to point to it. This ensures that dlt uses the mounted storage as its data directory instead of local disk space.
 
 
-### Setting `DLT_DATA_DIR`
+### Setting `NILUS_DATA_DIR`
 
-You can configure `DLT_DATA_DIR` in your environment setup as follows:
+You can configure `NILUS_DATA_DIR` in your environment setup as follows:
 
 ```py
 import os
@@ -355,8 +356,8 @@ import os
 # Define the path to your mounted external storage
 data_dir = "/path/to/mounted/bucket/dlt_pipeline_data"
 
-# Set the DLT_DATA_DIR environment variable
-os.environ["DLT_DATA_DIR"] = data_dir
+# Set the NILUS_DATA_DIR environment variable
+os.environ["NILUS_DATA_DIR"] = data_dir
 
 # Rest of your pipeline code
 ```

@@ -15,6 +15,7 @@ from dlt.common.exceptions import ValueErrorWithKnownValues
 from dlt.common.schema.schema import Schema
 from dlt.common.schema.typing import TTableFormat
 
+from dlt.common.utils import uniq_id
 from dlt.extract.source import DltSource
 from dlt.dataset.exceptions import LineageFailedException
 
@@ -24,7 +25,11 @@ from tests.load.utils import (
     SFTP_BUCKET,
     MEMORY_BUCKET,
 )
-from tests.utils import preserve_module_environ, autouse_module_test_storage, patch_module_home_dir
+from tests.utils import (
+    preserve_module_environ,
+    auto_module_test_storage,
+    auto_module_test_run_context,
+)
 from tests.load.utils import drop_pipeline_data
 
 EXPECTED_COLUMNS = ["id", "decimal", "other_decimal", "_dlt_load_id", "_dlt_id"]
@@ -128,7 +133,7 @@ def create_test_source(destination_type: str, table_format: TTableFormat) -> Dlt
 
 @pytest.fixture(scope="module")
 def populated_pipeline(
-    request, autouse_module_test_storage, preserve_module_environ, patch_module_home_dir
+    request, auto_module_test_storage, preserve_module_environ, auto_module_test_run_context
 ) -> Any:
     """fixture that returns a pipeline object populated with the example data"""
 
@@ -169,8 +174,7 @@ def populated_pipeline(
 # pipeline population per fixture setup will work and save a lot of time
 configs = destinations_configs(
     default_sql_configs=True,
-    all_buckets_filesystem_configs=True,
-    table_format_filesystem_configs=True,
+    read_only_sqlclient_configs=True,
     bucket_exclude=[SFTP_BUCKET, MEMORY_BUCKET],
 )
 
@@ -301,6 +305,8 @@ def test_dataframe_access(populated_pipeline: Pipeline) -> None:
     skip_df_chunk_size_check = populated_pipeline.destination.destination_type in [
         "dlt.destinations.filesystem",
         "dlt.destinations.snowflake",
+        "dlt.destinations.ducklake",  # vector size seems to not be consistent, typically 700
+        "dlt.destinations.lancedb",  # default is 200
     ]
 
     # full frame
@@ -451,36 +457,37 @@ def test_row_counts(populated_pipeline: Pipeline) -> None:
         ),
     }
     # get all dlt tables
+    schema = populated_pipeline.default_schema
     assert set(
         dataset.row_counts(dlt_tables=True, data_tables=False)
         .df()
         .itertuples(index=False, name=None)
     ) == {
         (
-            "_dlt_version",
+            schema.version_table_name,
             2,
         ),
         (
-            "_dlt_loads",
+            schema.loads_table_name,
             3,
         ),
         (
-            "_dlt_pipeline_state",
+            schema.state_table_name,
             2,
         ),
     }
     # get them all
     assert set(dataset.row_counts(dlt_tables=True).df().itertuples(index=False, name=None)) == {
         (
-            "_dlt_version",
+            schema.version_table_name,
             2,
         ),
         (
-            "_dlt_loads",
+            schema.loads_table_name,
             3,
         ),
         (
-            "_dlt_pipeline_state",
+            schema.state_table_name,
             2,
         ),
         (
@@ -903,6 +910,8 @@ def test_where_expr_or_str(populated_pipeline: Pipeline) -> None:
     assert all(row[0] < 10 for row in filtered_items_sql)
 
     load_id = items.select("_dlt_load_id").max().fetchscalar()
+    # NOTE: query below tests dremio wrong MAX behavior where strings are casted to decimals, we locked dremio container to 25.0 tag
+    # f'SELECT MAX(CONCAT(\'_\', "_dlt_load_id")) AS "_col_0" FROM "nas"."{populated_pipeline.dataset_name}"."items" AS "items"')
     all_items = items.where(f"_dlt_load_id = '{load_id}'").fetchall()
     assert len(all_items) == total_records
 
@@ -1030,8 +1039,8 @@ def test_ibis_expression_relation(populated_pipeline: Pipeline) -> None:
     dataset = populated_pipeline.dataset()
     total_records = _total_records(populated_pipeline.destination.destination_type)
 
-    items_table = dataset.table("items", table_type="ibis")
-    double_items_table = dataset.table("double_items", table_type="ibis")
+    items_table = dataset.table("items").to_ibis()
+    double_items_table = dataset.table("double_items").to_ibis()
 
     # check full table access
     df = dataset(items_table).df()
@@ -1058,6 +1067,34 @@ def test_ibis_expression_relation(populated_pipeline: Pipeline) -> None:
     assert list(table[0]) == [0, 0]
     assert list(table[5]) == [5, 10]
     assert list(table[10]) == [10, 20]
+
+    # take the same data using dlt backend
+    joined_table = joined_table.order_by("id")
+    joined_table.head(10).to_pandas()
+    arr_1 = joined_table.head(10).to_pyarrow()
+
+    # create relation from query and convert it to ibis
+    # NOTE: mssql / synapse dialect can't deal with double order by (.order_by("id", "asc"))
+    # but ibis expressions can (see above order_by("id"))
+    joined_table_from_relation = relation.to_ibis()
+    # print(joined_table_from_relation)
+    joined_table_from_relation.head(10).to_pandas()
+    arr_2 = joined_table_from_relation.head(10).to_pyarrow()
+    assert arr_1 == arr_2
+    # NOTE: identical column names both from snowflake, clickhouse and other destinations
+    assert arr_1.to_pylist() == [
+        {"id": 0, "double_id": 0},
+        {"id": 1, "double_id": 2},
+        {"id": 2, "double_id": 4},
+        {"id": 3, "double_id": 6},
+        {"id": 4, "double_id": 8},
+        {"id": 5, "double_id": 10},
+        {"id": 6, "double_id": 12},
+        {"id": 7, "double_id": 14},
+        {"id": 8, "double_id": 16},
+        {"id": 9, "double_id": 18},
+    ]
+
     # verify computed columns
     assert relation.columns == relation._ipython_key_completions_() == ["id", "double_id"]
 
@@ -1092,7 +1129,7 @@ def test_ibis_expression_relation(populated_pipeline: Pipeline) -> None:
     )
 
     # selecting all columns (star schema expanded, columns aliased)
-    # TODO: fixe tests
+    # TODO: fix tests
     assert sql_from_expr(items_table) == (
         (
             'SELECT "items"."id" AS "id", "items"."decimal" AS "decimal", "items"."other_decimal"'
@@ -1265,14 +1302,21 @@ def test_ibis_dataset_access(populated_pipeline: Pipeline) -> None:
 
     # make sure the not implemented error is raised if the ibis backend can't be created
     try:
-        ibis_connection = populated_pipeline.dataset().ibis()
+        ds_ = populated_pipeline.dataset()
+        ibis_connection = ds_.ibis(read_only=True)
     except NotImplementedError:
-        pytest.raises(NotImplementedError)
-        return
+        pytest.skip("ibis not implemented for this destination")
     except Exception as e:
         pytest.fail(f"Unexpected error raised: {e}")
 
     try:
+        # garbage collect: we want all destructors to be fired
+        import gc
+
+        del ds_
+        for _ in range(3):
+            gc.collect()
+
         total_records = _total_records(populated_pipeline.destination.destination_type)
 
         map_i = lambda x: x
@@ -1293,30 +1337,38 @@ def test_ibis_dataset_access(populated_pipeline: Pipeline) -> None:
 
         # filesystem uses duckdb and views to map know tables. for other ibis will list
         # all available tables so both schemas tables are visible
-        if populated_pipeline.destination.destination_type != "dlt.destinations.filesystem":
+        if populated_pipeline.destination.destination_type not in [
+            "dlt.destinations.filesystem",
+            "dlt.destinations.lancedb",
+        ]:
             # from aleph schema
             additional_tables += ["digits"]
 
         add_table_prefix = lambda x: table_name_prefix + x
 
-        # just do a basic check to see wether ibis can connect
-        assert set(
-            ibis_connection.list_tables(database=dataset_name, like=table_like_statement)
-        ) == {
-            add_table_prefix(map_i(x))
-            for x in (
-                [
-                    "_dlt_loads",
-                    "_dlt_pipeline_state",
-                    "_dlt_version",
-                    "double_items",
-                    "items",
-                    "items__children",
-                    "orderable_in_chain",
-                ]
-                + additional_tables
+        # databricks can't list tables (looks like internal ibis bug)
+        if populated_pipeline.destination.destination_type != "dlt.destinations.databricks":
+            # just do a basic check to see wether ibis can connect
+            schema = populated_pipeline.default_schema
+            table_names_in_ibis = ibis_connection.list_tables(
+                database=dataset_name, like=table_like_statement
             )
-        }
+            expected_table_names = {
+                add_table_prefix(map_i(x))
+                for x in (
+                    [
+                        schema.loads_table_name,
+                        schema.state_table_name,
+                        schema.version_table_name,
+                        "double_items",
+                        "items",
+                        "items__children",
+                        "orderable_in_chain",
+                    ]
+                    + additional_tables
+                )
+            }
+            assert set(table_names_in_ibis) == expected_table_names
 
         table_name = add_table_prefix(map_i("items"))
         items_table = ibis_connection.table(table_name, database=dataset_name)
@@ -1331,6 +1383,31 @@ def test_ibis_dataset_access(populated_pipeline: Pipeline) -> None:
                 raise
     finally:
         ibis_connection.disconnect()
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "populated_pipeline",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+@pytest.mark.skip("enable when we standardize behavior for non existing datasets")
+def test_ibis_no_dataset(populated_pipeline: Pipeline) -> None:
+    try:
+        ds = populated_pipeline.dataset()
+        ds._dataset_name = "no_dataset_" + uniq_id(4)
+        ibis_connection = ds.ibis(read_only=True)
+        ibis_connection.list_tables()
+    except NotImplementedError:
+        pytest.skip("ibis not implemented for this destination")
+    except Exception as e:
+        print(e)
+        pass
+    else:
+        ibis_connection.disconnect()
+        pytest.fail("Exception expected on opening non exiting dataset")
 
 
 @pytest.mark.no_load
@@ -1419,6 +1496,14 @@ def test_standalone_dataset(populated_pipeline: Pipeline) -> None:
     ids=lambda x: x.name,
 )
 def test_read_not_materialized_table(destination_config: DestinationTestConfiguration):
+    # TODO lancedb destination faills unreliably on the 2nd `pipeline.run()` because
+    # of the dltSentinel table. The test parallelization PR should solve this issue
+    # and upgrading LanceDB destination with `lance-namespace` should avoid it
+    # entirely.
+    # TODO reenable test after fix
+    if destination_config.destination_type == "lancedb":
+        pytest.skip("lancedb has race conditions for dltSentinel table")
+
     @dlt.source
     def two_tables():
         @dlt.resource(

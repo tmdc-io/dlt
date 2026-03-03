@@ -12,10 +12,11 @@ from typing import (
     Iterator,
     List,
     Tuple,
+    Dict,
 )
 
 from dlt.common.reflection.inspect import isasyncgenfunction, isgeneratorfunction
-from dlt.common.typing import AnyFun, AnyType, TDataItems
+from dlt.common.typing import AnyFun, AnyType, TDataItems, resolve_single_annotation
 from dlt.common.utils import get_callable_name, uniq_id
 
 from dlt.extract.exceptions import (
@@ -42,7 +43,7 @@ from dlt.extract.utils import (
 )
 
 
-class ForkPipe(ItemTransform[ResolvablePipeItem]):
+class ForkPipe(ItemTransform[ResolvablePipeItem, Dict[str, Any]]):
     placement_affinity: ClassVar[float] = 2
 
     def __init__(self, pipe: "Pipe", step: int = -1, copy_on_fork: bool = False) -> None:
@@ -347,10 +348,13 @@ class Pipe(SupportsPipe):
             #  below we import DltResource but Pipe class should not be dependent on it
             from dlt.extract.resource import DltResource
 
-            if sig.return_annotation != inspect.Signature.empty and inspect.isclass(
-                sig.return_annotation
-            ):
-                return issubclass(sig.return_annotation, DltResource)
+            if sig.return_annotation != inspect.Signature.empty:
+                # globals will contain DltResource which we want to resolve
+                return_annotation = resolve_single_annotation(
+                    sig.return_annotation, globalns=globals()
+                )
+                if inspect.isclass(return_annotation):
+                    return issubclass(return_annotation, DltResource)
 
         return False
 

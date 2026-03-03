@@ -129,6 +129,65 @@ def test_load_sql_schema_loads_all_tables_parallel(
     destinations_configs(default_sql_configs=True),
     ids=lambda x: x.name,
 )
+def test_load_sql_schema_loads_all_tables_parallel_connectorx_arrow_stream(
+    postgres_db: PostgresSourceDB,
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    pipeline = destination_config.setup_pipeline(
+        "test_load_sql_schema_loads_all_tables_parallel_connectorx", dev_mode=True
+    )
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION__EXCLUDED_COLUMNS"] = '["array_col"]'
+    os.environ["SOURCES__SQL_DATABASE__HAS_PRECISION_NULLABLE__EXCLUDED_COLUMNS"] = '["array_col"]'
+
+    source = sql_database(
+        credentials=postgres_db.credentials,
+        schema=postgres_db.schema,
+        backend="connectorx",
+        reflection_level="minimal",
+        backend_kwargs={"return_type": "arrow_stream"},
+        type_adapter_callback=default_test_callback(
+            destination_config.destination_type, "connectorx"
+        ),
+    ).parallelize()
+
+    if destination_config.destination_type == "bigquery":
+        # connectorx generates nanoseconds time which bigquery cannot load
+        source.has_precision.add_map(convert_time_to_us)
+        source.has_precision_nullable.add_map(convert_time_to_us)
+
+    load_info = pipeline.run(source)
+    # print(humanize.precisedelta(pipeline.last_trace.finished_at - pipeline.last_trace.started_at))
+    assert_load_info(load_info)
+    assert_row_counts(pipeline, postgres_db)
+
+    # make sure timestamp ntz is correct (stream converts them to dates, we convert them back)
+    assert (
+        pipeline.default_schema.tables["has_precision"]["columns"]["datetime_ntz_col"]["data_type"]
+        == "timestamp"
+    )
+    # fetch more than one row to avoid flakiness when first value lands on exact ms
+    data_ = pipeline.dataset().table("has_precision").limit(100).arrow()
+    import pyarrow as pa  # local import for assertions
+
+    # verify Arrow logical type and timezone
+    col_field = data_.schema.field("datetime_ntz_col")
+    assert pa.types.is_timestamp(col_field.type)
+    assert col_field.type.unit == "us"
+
+    # verify all values are millisecond multiples
+    # since arrow_stream returns timestamp columns as date64[ms] and we cast them to
+    # timestamps with microsecond precision
+    micros = pa.compute.cast(data_["datetime_ntz_col"], pa.int64()).combine_chunks()
+    for i in range(len(micros)):
+        assert micros[i].is_valid
+        assert micros[i].as_py() % 1000 == 0
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True),
+    ids=lambda x: x.name,
+)
 @pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
 def test_load_sql_table_names(
     postgres_db: PostgresSourceDB,
@@ -191,13 +250,13 @@ def test_load_sql_table_incremental(
     assert_row_counts(pipeline, postgres_db, tables)
 
 
-@pytest.mark.skip(reason="Skipping this test temporarily")
 @pytest.mark.parametrize(
     "destination_config",
     destinations_configs(default_sql_configs=True),
     ids=lambda x: x.name,
 )
 @pytest.mark.parametrize("backend", ["sqlalchemy", "pandas", "pyarrow", "connectorx"])
+@pytest.mark.rfam
 def test_load_mysql_data_load(
     destination_config: DestinationTestConfiguration, backend: TableBackend
 ) -> None:
@@ -227,11 +286,12 @@ def test_load_mysql_data_load(
         backend=backend,
         reflection_level="minimal",
         backend_kwargs=backend_kwargs,
+        chunk_size=100,
         # table_adapter_callback=_double_as_decimal_adapter,
     )
 
     pipeline = destination_config.setup_pipeline("test_load_mysql_data_load", dev_mode=True)
-    load_info = pipeline.run(family_table, write_disposition="merge")
+    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
     assert_load_info(load_info)
     counts_1 = load_table_counts(pipeline, "family")
 
@@ -243,13 +303,14 @@ def test_load_mysql_data_load(
         reflection_level="minimal",
         # we also try to remove dialect automatically
         backend_kwargs={},
+        chunk_size=100,
         # table_adapter_callback=_double_as_decimal_adapter,
     )
-    load_info = pipeline.run(family_table, write_disposition="merge")
+    load_info = pipeline.run(family_table.add_limit(1), write_disposition="merge")
     assert_load_info(load_info)
     counts_2 = load_table_counts(pipeline, "family")
     # no duplicates
-    assert counts_1 == counts_2
+    assert counts_1 == counts_2 == {"family": 100}
 
 
 @pytest.mark.parametrize(

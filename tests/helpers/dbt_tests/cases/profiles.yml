@@ -7,9 +7,9 @@ jaffle_shop:
   outputs:
     analytics:
       type: postgres
-      host: "{{ env_var('DLT__CREDENTIALS__HOST') }}"
-      user: "{{ env_var('DLT__CREDENTIALS__USERNAME') }}"
-      password: "{{ env_var('DLT__CREDENTIALS__PASSWORD') }}"
+      host: "{{ env_var('NILUS__CREDENTIALS__HOST') }}"
+      user: "{{ env_var('NILUS__CREDENTIALS__USERNAME') }}"
+      password: "{{ env_var('NILUS__CREDENTIALS__PASSWORD') }}"
       port: 5432
-      dbname: "{{ env_var('DLT__CREDENTIALS__DATABASE') }}"
+      dbname: "{{ env_var('NILUS__CREDENTIALS__DATABASE') }}"
       schema: "{{ var('dbt_schema') }}"

@@ -3,7 +3,7 @@ from copy import copy
 from typing import Any, Type
 import pytest
 import datetime  # noqa: I251
-from hexbytes import HexBytes
+from dlt.common.libs.hexbytes import HexBytes
 from enum import Enum
 
 from pendulum.tz import UTC

@@ -4,13 +4,10 @@ from types import ModuleType
 from functools import update_wrapper, wraps
 from typing import (
     Any,
-    Awaitable,
     Callable,
-    ClassVar,
     Dict,
     Iterator,
     List,
-    Literal,
     Optional,
     Tuple,
     Type,
@@ -105,7 +102,7 @@ class DltSourceFactoryWrapper(SourceFactory[TSourceFunParams, TDltSourceImpl]):
         self.name: str = None
         self.section: str = None
         self.max_table_nesting: int = None
-        self.root_key: bool = False
+        self.root_key: bool = None
         self.schema: Schema = None
         self.schema_contract: TSchemaContract = None
         self.spec: Type[BaseConfiguration] = None
@@ -353,7 +350,7 @@ def source(
     name: str = None,
     section: str = None,
     max_table_nesting: int = None,
-    root_key: bool = False,
+    root_key: bool = None,
     schema: Schema = None,
     schema_contract: TSchemaContract = None,
     spec: Type[BaseConfiguration] = None,
@@ -1020,6 +1017,15 @@ def get_resource() -> DltResource:
     """
     source = get_source()
     return source.resources.with_pipe(get_current_pipe())
+
+
+def get_resource_metrics() -> Dict[str, Any]:
+    """Should be executed from inside the function decorated with @dlt.resource
+
+    Returns:
+        Dict[str, Any]: The customizable metrics dictionary
+    """
+    return get_resource().custom_metrics
 
 
 TBoundItems = TypeVar("TBoundItems", bound=TDataItems)

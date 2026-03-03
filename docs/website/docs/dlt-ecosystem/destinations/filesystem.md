@@ -15,7 +15,7 @@ pip install "dlt[filesystem]"
 
 This installs the `s3fs` and `botocore` packages.
 
-:::caution
+:::warning
 
 You may also install the dependencies independently. Try:
 ```sh
@@ -24,6 +24,8 @@ pip install s3fs
 ```
 so pip does not fail on backtracking.
 :::
+
+<!--@@@DLT_DESTINATION_CAPABILITIES filesystem-->
 
 ## Initialize the dlt project
 
@@ -206,6 +208,12 @@ Remember to include `storage_account_name` with your base host ie. `dlt_ci.blob.
 
 :::tip OneLake (Fabric)
 Use the Blob endpoint (`azure_account_host = "onelake.blob.fabric.microsoft.com"`).
+
+**IMPORTANT**: OneLake bucket URLs must use **GUIDs** for workspace and lakehouse, not display names:
+```toml
+bucket_url = "abfss://<workspace_guid>@onelake.dfs.fabric.microsoft.com/<lakehouse_guid>/Files"
+```
+Find GUIDs in your browser URL when viewing workspace/lakehouse in Fabric portal.
 :::
 
 Two forms of Azure credentials are supported:
@@ -239,7 +247,7 @@ azure_client_secret = "client_secret"
 azure_tenant_id = "tenant_id" # please set me up!
 ```
 
-:::caution
+:::warning
 **Concurrent blob uploads**
 `dlt` limits the number of concurrent connections for a single uploaded blob to 1. By default, `adlfs` that we use splits blobs into 4 MB chunks and uploads them concurrently, which leads to gigabytes of used memory and thousands of connections for larger load packages. You can increase the maximum concurrency as follows:
 ```toml
@@ -306,7 +314,7 @@ bucket_url="file://localhost/c$/a/b/c"
 bucket_url="file:////localhost/c$/a/b/c"
 ```
 
-:::caution
+:::warning
 Windows supports paths up to 255 characters. When you access a path longer than 255 characters, you'll see a `FileNotFound` exception.
 
 To overcome this limit, you can use [extended paths](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=registry). `dlt` recognizes both regular and UNC extended paths.

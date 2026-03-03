@@ -216,6 +216,7 @@ class SqlalchemyClient(SqlClientBase[Connection]):
                 self.execute_sql(statement, fn=new_db_fn, name=dataset_name)
             # WAL mode is applied to all currently attached databases
             self.execute_sql("PRAGMA journal_mode=WAL")
+            self.execute_sql("PRAGMA synchronous=NORMAL;")
         self._sqlite_attached_datasets.add(dataset_name)
 
     def _sqlite_drop_dataset(self, dataset_name: str) -> None:
@@ -452,6 +453,11 @@ class SqlalchemyClient(SqlClientBase[Connection]):
             return DatabaseTransientException(e)
         elif isinstance(e, sa.exc.IntegrityError):
             return DatabaseTerminalException(e)
+        elif isinstance(e, sa.exc.DatabaseError):
+            if "oracle" in msg:
+                if "00942" in msg and "does not exist" in msg:  # ORA-00942
+                    return DatabaseUndefinedRelation(e)
+            return DatabaseTransientException(e)
         elif isinstance(e, sa.exc.SQLAlchemyError):
             return DatabaseTransientException(e)
         else:

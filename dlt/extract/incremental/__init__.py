@@ -1,6 +1,16 @@
 import os
 from datetime import datetime  # noqa: I251
-from typing import Generic, ClassVar, Any, Optional, Type, Dict, Union, Literal, Tuple
+from typing import (
+    Generic,
+    ClassVar,
+    Any,
+    Optional,
+    Type,
+    Dict,
+    Union,
+    Literal,
+    Tuple,
+)
 
 import inspect
 from functools import wraps
@@ -20,6 +30,8 @@ from dlt.common.typing import (
     is_optional_type,
     is_subclass,
     TColumnNames,
+    TypedDict,
+    resolve_single_annotation,
 )
 from dlt.common.configuration import configspec, ConfigurationValueError
 from dlt.common.configuration.specs import BaseConfiguration
@@ -28,7 +40,7 @@ from dlt.common.data_types.type_helpers import (
     coerce_value,
     py_type_to_sc_type,
 )
-
+from dlt.common.data_writers.writers import count_rows_in_items
 from dlt.extract.exceptions import IncrementalUnboundError
 from dlt.extract.incremental.exceptions import (
     IncrementalCursorPathMissing,
@@ -43,7 +55,7 @@ from dlt.common.incremental.typing import (
     TIncrementalRange,
 )
 from dlt.extract.items import SupportsPipe, TTableHintTemplate
-from dlt.extract.items_transform import ItemTransform
+from dlt.extract.items_transform import BaseItemTransform, ItemTransform
 from dlt.extract.state import resource_state
 from dlt.extract.incremental.transform import (
     JsonIncremental,
@@ -63,8 +75,17 @@ except MissingDependencyException:
     pandas = None
 
 
+class IncrementalCustomMetrics(TypedDict, total=False):
+    unfiltered_items_count: int
+    unfiltered_batches_count: int
+    initial_unique_hashes_count: int
+    final_unique_hashes_count: int
+
+
 @configspec
-class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorValue]):
+class Incremental(
+    ItemTransform[TDataItem, IncrementalCustomMetrics], BaseConfiguration, Generic[TCursorValue]
+):
     """Adds incremental extraction for a resource by storing a cursor value in persistent state.
 
     The cursor could for example be a timestamp for when the record was created and you can use this to load only
@@ -164,6 +185,7 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         self.start_value: Any = initial_value
         """Value of last_value at the beginning of current pipeline run"""
         self.resource_name: Optional[str] = None
+        # TODO: deprecate primary_key, use deduplication_key
         self._primary_key: Optional[TTableHintTemplate[TColumnNames]] = primary_key
         self.row_order = row_order
         self.allow_external_schedulers = allow_external_schedulers
@@ -190,6 +212,12 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         """Bound pipe"""
         self.range_start = range_start
         self.range_end = range_end
+        self._custom_metrics: IncrementalCustomMetrics = {
+            "unfiltered_items_count": 0,
+            "unfiltered_batches_count": 0,
+            "initial_unique_hashes_count": 0,
+            "final_unique_hashes_count": 0,
+        }
 
     @property
     def primary_key(self) -> Optional[TTableHintTemplate[TColumnNames]]:
@@ -330,7 +358,11 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
             self.initial_value = native_value
 
     def get_state(self) -> IncrementalColumnState:
-        """Returns an Incremental state for a particular cursor column"""
+        """Returns or creates an Incremental state for a particular cursor column
+
+        If end_value is set, a mock state is created that will be discarded after extract step
+        Otherwise state is taken from current pipeline and will be persisted in it
+        """
         if self.end_value is not None:
             # End value uses mock state. We don't want to write it.
             return {
@@ -352,13 +384,11 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
                     "unique_hashes": [],
                 }
             )
-        else:
-            # update initial value in existing state
-            self._cached_state["initial_value"] = self.initial_value
         return self._cached_state
 
     @staticmethod
     def _get_state(resource_name: str, cursor_path: str) -> IncrementalColumnState:
+        """Retrieve the sate from currently active pipeline"""
         state: IncrementalColumnState = (
             resource_state(resource_name).setdefault("incremental", {}).setdefault(cursor_path, {})
         )
@@ -467,9 +497,9 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         except Exception:
             pass
 
-        if start_value := os.environ.get("DLT_START_VALUE"):
+        if start_value := os.environ.get("NILUS_START_VALUE"):
             self.initial_value = coerce_value(data_type, "text", start_value)
-            if end_value := os.environ.get("DLT_END_VALUE"):
+            if end_value := os.environ.get("NILUS_END_VALUE"):
                 self.end_value = coerce_value(data_type, "text", end_value)
             else:
                 self.end_value = None
@@ -489,7 +519,10 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         self.start_value = self.last_value
         logger.info(
             f"Bind incremental on {self.resource_name} with initial_value: {self.initial_value},"
-            f" start_value: {self.start_value}, end_value: {self.end_value}"
+            f" start_value: {self.start_value}, end_value: {self.end_value}, func:"
+            f" {self.last_value_func.__name__}, row_order: {self.row_order}, on_missing:"
+            f" {self.on_cursor_value_missing}, range_start: {self.range_start}, range_end:"
+            f" {self.range_end}"
         )
         # cache state
         self._cached_state = self.get_state()
@@ -560,6 +593,11 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
         # example: MaterializedEmptyList
         if rows is None or (isinstance(rows, list) and len(rows) == 0):
             return rows
+
+        # collect metrics
+        self.custom_metrics["unfiltered_items_count"] += count_rows_in_items(rows)
+        self.custom_metrics["unfiltered_batches_count"] += 1
+
         transformer = self._get_transform(rows)
         if isinstance(rows, list):
             rows = [
@@ -567,6 +605,9 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
                 for item in (self._transform_item(transformer, row) for row in rows)
                 if item is not None
             ]
+            # return None if fully consumed like FilterItem (Incremental is just a very complicated FilterItem)
+            if len(rows) == 0:
+                rows = None
         else:
             rows = self._transform_item(transformer, rows)
 
@@ -586,13 +627,19 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
                 transformer.compute_unique_value(row, self.primary_key)
                 for row in transformer.last_rows
             )
-            initial_hash_count = len(self._cached_state.get("unique_hashes", []))
+            initial_hash_list = self._cached_state.get("unique_hashes")
+            initial_hash_count = len(initial_hash_list) if initial_hash_list else 0
+            self.custom_metrics["initial_unique_hashes_count"] = initial_hash_count
+
             # add directly computed hashes
             unique_hashes.update(transformer.unique_hashes)
             self._cached_state["unique_hashes"] = list(unique_hashes)
             final_hash_count = len(self._cached_state["unique_hashes"])
+            self.custom_metrics["final_unique_hashes_count"] = final_hash_count
 
             self._check_duplicate_cursor_threshold(initial_hash_count, final_hash_count)
+        else:
+            self._cached_state["unique_hashes"] = []
         return rows
 
     def _check_duplicate_cursor_threshold(
@@ -600,12 +647,11 @@ class Incremental(ItemTransform[TDataItem], BaseConfiguration, Generic[TCursorVa
     ) -> None:
         if initial_hash_count <= Incremental.duplicate_cursor_warning_threshold < final_hash_count:
             logger.warning(
-                f"Large number of records ({final_hash_count}) sharing the same value of "
-                f"cursor field '{self.cursor_path}'. This can happen if the cursor "
-                "field has a low resolution (e.g., only stores dates without times), "
-                "causing many records to share the same cursor value. "
-                "Consider using a cursor column with higher resolution to reduce "
-                "the deduplication state size."
+                f"Large number of records ({final_hash_count}) sharing the same value of cursor"
+                f" field '{self.cursor_path}' on resource '{self.resource_name}'. This can happen"
+                " if the cursor field has a low resolution (e.g., only stores dates without"
+                " times), causing many records to share the same cursor value. Consider using a"
+                " cursor column with higher resolution to reduce the deduplication state size."
             )
 
 
@@ -615,7 +661,7 @@ Incremental.EMPTY.__is_resolved__ = True
 TIncrementalConfig = Union[Incremental[Any], IncrementalArgs]
 
 
-class IncrementalResourceWrapper(ItemTransform[TDataItem]):
+class IncrementalResourceWrapper(ItemTransform[TDataItem, IncrementalCustomMetrics]):
     placement_affinity: ClassVar[float] = 1  # stick to end
 
     _incremental: Optional[Incremental[Any]] = None
@@ -647,7 +693,9 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
     def get_incremental_arg(sig: inspect.Signature) -> Optional[inspect.Parameter]:
         incremental_param: Optional[inspect.Parameter] = None
         for p in sig.parameters.values():
-            annotation = extract_inner_type(p.annotation)
+            annotation = extract_inner_type(
+                resolve_single_annotation(p.annotation, globalns=globals())
+            )
             if is_subclass(annotation, Incremental) or isinstance(p.default, Incremental):
                 incremental_param = p
                 break
@@ -775,6 +823,13 @@ class IncrementalResourceWrapper(ItemTransform[TDataItem]):
         self._allow_external_schedulers = value
         if self._incremental:
             self._incremental.allow_external_schedulers = value
+
+    @property
+    def custom_metrics(self) -> IncrementalCustomMetrics:
+        """Returns custom metrics of the Incremental object itself if exists"""
+        if self._incremental:
+            return self._incremental.custom_metrics
+        return {}
 
     def bind(self, pipe: SupportsPipe) -> "IncrementalResourceWrapper":
         # if pipe is None we are re-binding internal incremental

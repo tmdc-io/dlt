@@ -9,7 +9,6 @@ import dlt
 
 from dlt.common import json, pendulum
 from dlt.common.configuration.container import Container
-from dlt.common.destination.utils import resolve_merge_strategy
 from dlt.common.pipeline import StateInjectableContext
 from dlt.common.schema.utils import has_table_seen_data
 from dlt.common.schema.exceptions import (
@@ -20,7 +19,7 @@ from dlt.common.schema.exceptions import (
 from dlt.common.schema.typing import TLoaderMergeStrategy, TTableFormat
 from dlt.common.typing import StrAny
 from dlt.common.utils import digest128
-from dlt.common.destination import AnyDestination, DestinationCapabilitiesContext
+from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.destination.exceptions import DestinationCapabilitiesException
 from dlt.common.libs.pyarrow import row_tuples_to_arrow
 
@@ -72,6 +71,19 @@ def test_merge_on_keys_in_schema_nested_hints(
     with open("tests/common/cases/schemas/eth/ethereum_schema_v11.yml", "r", encoding="utf-8") as f:
         schema = dlt.Schema.from_dict(yaml.safe_load(f))
 
+    if destination_config.destination_type == "databricks":
+        # remove `partition` hint because it conflicts with `cluster` on databricks
+        schema.merge_hints({"partition": []}, replace=True)
+
+    if destination_config.destination_type == "clickhouse":
+        # remove `partition` hint because it conflicts with `nullable` on clickhouse
+        schema.merge_hints({"partition": []}, replace=True)
+        # remove `sort` hints because it conflicts with `primary_key` on clickhouse
+        for table in schema.tables.values():
+            for column in table["columns"].values():
+                if "sort" in column:
+                    del column["sort"]
+
     # make block uncles unseen to trigger filtering loader in loader for nested tables
     if has_table_seen_data(schema.tables["blocks__uncles"]):
         del schema.tables["blocks__uncles"]["x-normalizer"]
@@ -91,15 +103,16 @@ def test_merge_on_keys_in_schema_nested_hints(
     }
 
     @dlt.source(schema=schema)
-    def ethereum(slice_: slice = None):
+    def ethereum(slice_: slice = None, duplicates: int = 0):
         @dlt.resource(**hints, nested_hints=nested_hints)  # type: ignore[call-overload]
         def blocks():
-            with open(
-                "tests/normalize/cases/ethereum.blocks.9c1d9b504ea240a482b007788d5cd61c_2.json",
-                "r",
-                encoding="utf-8",
-            ) as f:
-                yield json.load(f) if slice_ is None else json.load(f)[slice_]
+            for _ in range(duplicates + 1):
+                with open(
+                    "tests/normalize/cases/ethereum.blocks.9c1d9b504ea240a482b007788d5cd61c_2.json",
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    yield json.load(f) if slice_ is None else json.load(f)[slice_]
 
         return blocks()
 
@@ -1598,9 +1611,11 @@ def test_merge_strategy_config() -> None:
     assert "scd2" not in p.destination.capabilities().supported_merge_strategies
     with pytest.raises(PipelineStepFailed) as pip_ex:
         p.run(r())
-    assert pip_ex.value.step == "normalize"  # failed already in normalize when generating row ids
+    assert (
+        pip_ex.value.step == "extract"
+    )  # fails when table is added to schema and root key requirements are validated
     # PipelineStepFailed -> NormalizeJobFailed -> DestinationCapabilitiesException
-    assert isinstance(pip_ex.value.__cause__.__cause__, DestinationCapabilitiesException)
+    assert isinstance(pip_ex.value.__cause__, DestinationCapabilitiesException)
 
 
 @pytest.mark.parametrize(

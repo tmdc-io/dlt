@@ -26,6 +26,8 @@ from dlt.common.normalizers import TNormalizersConfig, NamingConvention
 from dlt.common.normalizers.json import DataItemNormalizer, TNormalizedRowIterator
 from dlt.common.schema import utils
 from dlt.common.data_types import TDataType
+from dlt.common.schema.utils import is_dlt_table_or_column
+from dlt.common.data_types import TDataType
 from dlt.common.schema.typing import (
     DLT_NAME_PREFIX,
     SCHEMA_ENGINE_VERSION,
@@ -37,8 +39,10 @@ from dlt.common.schema.typing import (
     TSchemaEvolutionMode,
     TSchemaSettings,
     TSimpleRegex,
+    TTableReferenceStandalone,
     TStoredSchema,
     TSchemaTables,
+    TTableReference,
     TTableSchema,
     TTableSchemaColumns,
     TColumnSchema,
@@ -55,6 +59,7 @@ from dlt.common.schema.exceptions import (
     TableIdentifiersFrozen,
     TableNotFound,
 )
+from dlt.common.schema.utils import is_complete_column
 from dlt.common.schema.normalizers import import_normalizers, configured_normalizers
 from dlt.common.schema.exceptions import DataValidationError
 from dlt.common.validation import validate_dict
@@ -231,15 +236,30 @@ class Schema:
         if is_new_table or existing_table.get("x-normalizer", {}).get("evolve-columns-once", False):
             column_mode = "evolve"
 
-        # check if we should filter any columns, partial table below contains only new columns
+        # check if we should filter any columns,
+        # partial table below contains new columns and existing columns with property changes
         filters: List[Tuple[TSchemaContractEntities, str, TSchemaEvolutionMode]] = []
         for column_name, column in list(partial_table["columns"].items()):
             # dlt cols may always be added
-            if column_name.startswith(self._dlt_tables_prefix):
+            if is_dlt_table_or_column(column_name, self._dlt_tables_prefix):
                 continue
             is_variant = column.get("variant", False)
-            # new column and contract prohibits that
+            # check if column already exists to distinguish between new column vs property change
+            existing_col = existing_table["columns"].get(column_name) if existing_table else None
+            # when column is new or has property changes, and contract prohibits column evolution
             if column_mode != "evolve" and not is_variant:
+                if existing_col and is_complete_column(existing_col):
+                    error_msg = (
+                        f"Can't evolve table column `{column_name}` in table `{table_name}` because"
+                        " `columns` are frozen. Existing column: {existing_col}. Incoming"
+                        " column: {column}."
+                    )
+                else:
+                    error_msg = (
+                        f"Can't add table column `{column_name}` to table `{table_name}` because"
+                        " `columns` are frozen."
+                    )
+
                 if raise_on_freeze and column_mode == "freeze":
                     raise DataValidationError(
                         self.name,
@@ -250,8 +270,7 @@ class Schema:
                         existing_table,
                         schema_contract,
                         data_item,
-                        f"Can't add table column `{column_name}` to table `{table_name}` because"
-                        " `columns` are frozen.",
+                        error_msg,
                     )
                 # filter column with name below
                 filters.append(("columns", column_name, column_mode))
@@ -297,7 +316,7 @@ class Schema:
         """Resolve the exact applicable schema contract settings for the table `table_name`. `new_table_schema` is added to the tree during the resolution."""
 
         settings: TSchemaContract = {}
-        if not table_name.startswith(self._dlt_tables_prefix):
+        if not is_dlt_table_or_column(table_name, self._dlt_tables_prefix):
             if new_table_schema:
                 tables = copy(self._schema_tables)
                 tables[table_name] = new_table_schema
@@ -357,22 +376,42 @@ class Schema:
         self._settings = deepcopy(schema.settings)
         # make shallow copy of normalizer settings
         self._configure_normalizers(copy(schema._normalizers_config))
+        self.data_item_normalizer.extend_schema(extend_tables=False)
         self._compile_settings()
-        # update all tables
-        for table in schema.tables.values():
-            self.update_table(table)
+        # update all tables starting for parents and then nested tables in order
+        tables = list(schema.tables.values())
+        for table in tables:
+            if not utils.is_nested_table(table):
+                for chain_table in utils.get_nested_tables(schema._schema_tables, table["name"]):
+                    self.update_table(chain_table)
 
-    def drop_tables(
-        self, table_names: Sequence[str], seen_data_only: bool = False
-    ) -> List[TTableSchema]:
-        """Drops tables from the schema and returns the dropped tables"""
+    def drop_tables(self, table_names: Sequence[str]) -> List[TTableSchema]:
+        """Drops tables from the schema and returns the dropped tables. List of table names
+        must contain all nested tables to tables being dropped.
+        """
         result = []
-        # TODO: make sure all nested tables to table_names are also dropped
+        candidates = set()
+
         for table_name in table_names:
-            table = self.get_table(table_name)
-            if table and (not seen_data_only or utils.has_table_seen_data(table)):
+            if self.get_table(table_name) and table_name not in candidates:
+                candidates.add(table_name)
+                # also add table chain
+                candidates.update(
+                    t["name"] for t in utils.get_nested_tables(self._schema_tables, table_name)
+                )
+        # compare extension with original list
+        if orphaned := candidates.difference(table_names):
+            raise SchemaCorruptedException(
+                self._schema_name,
+                "A set tables to drop would leave orphaned tables. Please use consistent list of "
+                f"table names in `drop_table`. Orphaned tabled: {orphaned}",
+            )
+        # final drop
+        for table_name in table_names:
+            if table_name in candidates:
                 result.append(self._schema_tables.pop(table_name))
                 self.data_item_normalizer.remove_table(table_name)
+
         return result
 
     def filter_row_with_hint(
@@ -398,13 +437,14 @@ class Schema:
     def merge_hints(
         self,
         new_hints: Mapping[TColumnDefaultHint, Sequence[TSimpleRegex]],
+        replace: bool = False,
         normalize_identifiers: bool = True,
     ) -> None:
-        """Merges existing default hints with `new_hints`. Normalizes names in column regexes if possible. Compiles setting at the end
+        """Merges or replace existing default hints with `new_hints`. Normalizes names in column regexes if possible. Compiles setting at the end
 
         NOTE: you can manipulate default hints collection directly via `Schema.settings` as long as you call Schema._compile_settings() at the end.
         """
-        self._merge_hints(new_hints, normalize_identifiers)
+        self._merge_hints(new_hints, replace=replace, normalize_identifiers=normalize_identifiers)
         self._compile_settings()
 
     def update_preferred_types(
@@ -485,7 +525,7 @@ class Schema:
         return [
             t
             for t in self._schema_tables.values()
-            if not t["name"].startswith(self._dlt_tables_prefix)
+            if not is_dlt_table_or_column(t["name"], self._dlt_tables_prefix)
             and (
                 (
                     include_incomplete
@@ -509,7 +549,9 @@ class Schema:
     def dlt_tables(self) -> List[TTableSchema]:
         """Gets dlt tables"""
         return [
-            t for t in self._schema_tables.values() if t["name"].startswith(self._dlt_tables_prefix)
+            t
+            for t in self._schema_tables.values()
+            if is_dlt_table_or_column(t["name"], self._dlt_tables_prefix)
         ]
 
     def dlt_table_names(self) -> List[str]:
@@ -584,6 +626,58 @@ class Schema:
     def tables(self) -> TSchemaTables:
         """Dictionary of schema tables"""
         return self._schema_tables
+
+    @property
+    def references(self) -> list[TTableReferenceStandalone]:
+        """References between tables"""
+        all_references: list[TTableReferenceStandalone] = []
+        for table_name, table in self.tables.items():
+            # TODO more specific error handling than ValueError
+            try:
+                parent_ref = utils.create_parent_child_reference(self.tables, table_name)
+                all_references.append(cast(TTableReferenceStandalone, parent_ref))
+            except ValueError:
+                pass
+
+            try:
+                root_ref = utils.create_root_child_reference(self.tables, table_name)
+                all_references.append(cast(TTableReferenceStandalone, root_ref))
+            except ValueError:
+                pass
+
+            try:
+                load_table_ref = utils.create_load_table_reference(
+                    self.tables[table_name], naming=self.naming
+                )
+                all_references.append(cast(TTableReferenceStandalone, load_table_ref))
+            except ValueError:
+                pass
+
+            refs = table.get("references")
+            if not refs:
+                continue
+
+            for ref in refs:
+                top_level_ref: TTableReference = ref.copy()
+                if top_level_ref.get("table") is None:
+                    top_level_ref["table"] = table_name
+
+                all_references.append(cast(TTableReferenceStandalone, top_level_ref))
+
+        # internal references with `_dlt_version` need to be extracted once
+        try:
+            version_table_hash_ref = utils.create_version_and_loads_hash_reference(
+                self.tables, naming=self.naming
+            )
+            version_table_schema_name_ref = utils.create_version_and_loads_schema_name_reference(
+                self.tables, naming=self.naming
+            )
+            all_references.append(cast(TTableReferenceStandalone, version_table_hash_ref))
+            all_references.append(cast(TTableReferenceStandalone, version_table_schema_name_ref))
+        except ValueError:
+            pass
+
+        return all_references
 
     @property
     def settings(self) -> TSchemaSettings:
@@ -733,6 +827,42 @@ class Schema:
         )
         return dot
 
+    def to_mermaid(
+        self,
+        remove_processing_hints: bool = False,
+        hide_columns: bool = False,
+        hide_descriptions: bool = False,
+        include_dlt_tables: bool = True,
+    ) -> str:
+        """Convert schema to a Mermaid diagram string.
+        Args:
+            remove_processing_hints: If True, remove hints used for data processing and redundant information.
+                This reduces the size of the schema and improves readability.
+            hide_columns: If True, the diagram hides columns details. This helps readability of large diagrams.
+            hide_descriptions: If True, hide the column descriptions
+            include_dlt_tables: If `True` (the default), internal dlt tables (`_dlt_version`,
+                `_dlt_loads`, `_dlt_pipeline_state`)
+
+        Returns:
+            A string containing a Mermaid ERdiagram of the schema.
+        """
+        from dlt.helpers.mermaid import schema_to_mermaid
+
+        stored_schema = self.to_dict(
+            # setting this to `True` removes `name` fields that are used in `schema_to_dbml()`
+            # if required, we can refactor `dlt.helpers.dbml` to support this
+            remove_defaults=False,
+            remove_processing_hints=remove_processing_hints,
+        )
+
+        return schema_to_mermaid(
+            stored_schema,
+            references=self.references,
+            hide_columns=hide_columns,
+            hide_descriptions=hide_descriptions,
+            include_dlt_tables=include_dlt_tables,
+        )
+
     def clone(
         self,
         with_name: str = None,
@@ -766,6 +896,7 @@ class Schema:
         as textual parts can be extracted from an expression.
         """
         self._configure_normalizers(configured_normalizers(schema_name=self._schema_name))
+        self.data_item_normalizer.extend_schema()
         self._compile_settings()
 
     def will_update_normalizers(self) -> bool:
@@ -792,6 +923,7 @@ class Schema:
     def _merge_hints(
         self,
         new_hints: Mapping[TColumnDefaultHint, Sequence[TSimpleRegex]],
+        replace: bool = False,
         normalize_identifiers: bool = True,
     ) -> None:
         """Used by `merge_hints method, does not compile settings at the end"""
@@ -808,7 +940,7 @@ class Schema:
         default_hints = self._settings.setdefault("default_hints", {})
         # add `new_hints` to existing hints
         for h, l in new_hints.items():
-            if h in default_hints:
+            if h in default_hints and not replace:
                 extend_list_deduplicated(default_hints[h], l, utils.canonical_simple_regex)
             else:
                 # set new hint type
@@ -1012,7 +1144,7 @@ class Schema:
         self.state_table_name = to_naming.normalize_table_identifier(PIPELINE_STATE_TABLE_NAME)
         # do a sanity check - dlt tables must start with dlt prefix
         for table_name in [self.version_table_name, self.loads_table_name, self.state_table_name]:
-            if not table_name.startswith(self._dlt_tables_prefix):
+            if not is_dlt_table_or_column(table_name, self._dlt_tables_prefix):
                 raise SchemaCorruptedException(
                     self.name,
                     f"A naming convention `{self.naming.name()}` mangles `_dlt` table prefix to"
@@ -1042,7 +1174,6 @@ class Schema:
         self._replace_and_apply_naming(normalizers_config, to_naming, self.naming)
         # data item normalization function
         self.data_item_normalizer = item_normalizer_class(self)
-        self.data_item_normalizer.extend_schema()
 
     def _reset_schema(self, name: str, normalizers: TNormalizersConfig = None) -> None:
         self._schema_tables: TSchemaTables = {}
@@ -1072,6 +1203,7 @@ class Schema:
         if not normalizers:
             normalizers = configured_normalizers(schema_name=self._schema_name)
         self._configure_normalizers(normalizers)
+        self.data_item_normalizer.extend_schema()  # type: ignore[attr-defined]
         # add version tables
         self._add_standard_tables()
         # compile all known regexes

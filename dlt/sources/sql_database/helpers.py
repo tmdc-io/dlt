@@ -24,6 +24,7 @@ from dlt.common.configuration.specs import (
 from dlt.common.exceptions import DltException, MissingDependencyException
 from dlt.common.schema import TTableSchemaColumns
 from dlt.common.schema.typing import TWriteDispositionDict
+from dlt.common.schema.utils import merge_columns
 from dlt.common.typing import TColumnNames, TDataItem, TSortOrder
 from dlt.common.jsonpath import extract_simple_field_name
 from dlt.common.utils import is_typeerror_due_to_wrong_call
@@ -48,6 +49,8 @@ from dlt.common.libs.sql_alchemy import (
     MetaData,
     sa,
     TextClause,
+    ORACLE_NUMBER,
+    OracleDialect,
 )
 
 TableBackend = Literal["sqlalchemy", "pyarrow", "pandas", "connectorx"]
@@ -193,28 +196,31 @@ class TableLoader:
     def _load_rows(self, query: SelectClause, backend_kwargs: Dict[str, Any]) -> TDataItem:
         with self.engine.connect() as conn:
             result = conn.execution_options(yield_per=self.chunk_size).execute(query)
-            # NOTE: cursor returns not normalized column names! may be quite useful in case of Oracle dialect
-            # that normalizes columns
-            # columns = [c[0] for c in result.cursor.description]
-            columns = list(result.keys())
-            for partition in result.partitions(size=self.chunk_size):
-                if self.backend == "sqlalchemy":
-                    yield [dict(row._mapping) for row in partition]
-                elif self.backend == "pandas":
-                    from dlt.common.libs.pandas_sql import _wrap_result
+            try:
+                # NOTE: cursor returns not normalized column names! may be quite useful in case of Oracle dialect
+                # that normalizes columns
+                # columns = [c[0] for c in result.cursor.description]
+                columns = list(result.keys())
+                for partition in result.partitions(size=self.chunk_size):
+                    if self.backend == "sqlalchemy":
+                        yield [dict(row._mapping) for row in partition]
+                    elif self.backend == "pandas":
+                        from dlt.common.libs.pandas_sql import _wrap_result
 
-                    df = _wrap_result(
-                        partition,
-                        columns,
-                        **{"dtype_backend": "pyarrow", **backend_kwargs},
-                    )
-                    yield df
-                elif self.backend == "pyarrow":
-                    yield row_tuples_to_arrow(
-                        partition,
-                        columns=_add_missing_columns(self.columns, columns),
-                        tz=backend_kwargs.get("tz", "UTC"),
-                    )
+                        df = _wrap_result(
+                            partition,
+                            columns,
+                            **{"dtype_backend": "pyarrow", **backend_kwargs},
+                        )
+                        yield df
+                    elif self.backend == "pyarrow":
+                        yield row_tuples_to_arrow(
+                            partition,
+                            columns=_add_missing_columns(self.columns, columns),
+                            tz=backend_kwargs.get("tz", "UTC"),
+                        )
+            finally:
+                result.close()
 
     def _load_rows_connectorx(
         self, query: SelectClause, backend_kwargs: Dict[str, Any]
@@ -224,12 +230,23 @@ class TableLoader:
         except ImportError:
             raise MissingDependencyException("Connector X table backend", ["connectorx"])
 
+        import pyarrow as pa
+        from dlt.common.libs.pyarrow import cast_date64_columns_to_timestamp
+
         # default settings
         backend_kwargs = {
-            "return_type": "arrow",
             "protocol": "binary",
             **backend_kwargs,
         }
+
+        is_streaming = False
+        if "return_type" in backend_kwargs:
+            if backend_kwargs["return_type"] == "arrow_stream":
+                is_streaming = True
+                backend_kwargs["batch_size"] = backend_kwargs.get("batch_size", self.chunk_size)
+        else:
+            backend_kwargs["return_type"] = "arrow"
+
         conn = backend_kwargs.pop(
             "conn",
             self.engine.url._replace(
@@ -245,8 +262,21 @@ class TableLoader:
                 f" literals that cannot be rendered, upgrade to 2.x: `{str(ex)}`"
             ) from ex
         logger.info(f"Executing query on ConnectorX: {query_str}")
-        df = cx.read_sql(conn, query_str, **backend_kwargs)
-        yield self._maybe_fix_0000_timezone(df)
+
+        if is_streaming:
+            record_reader = cx.read_sql(conn, query_str, **backend_kwargs)
+            for record_batch in record_reader:
+                table = pa.Table.from_batches((record_batch,), schema=record_batch.schema)
+                yield cast_date64_columns_to_timestamp(self._maybe_fix_0000_timezone(table))
+        else:
+            df = cx.read_sql(conn, query_str, **backend_kwargs)
+            if len(df) > self.chunk_size:
+                logger.info(
+                    f"The size of the dataset being loaded is more than {self.chunk_size}, consider"
+                    " using streaming mode (see"
+                    " https://dlthub.com/docs/dlt-ecosystem/verified-sources/sql_database/configuration#connectorx)"
+                )
+            yield self._maybe_fix_0000_timezone(df)
 
     def _maybe_fix_0000_timezone(self, df: Any) -> Any:
         """Optionally convert +00:00 timezone to UTC"""
@@ -277,6 +307,21 @@ def table_rows(
     query_adapter_callback: Optional[TQueryAdapter],
     resolve_foreign_keys: bool,
 ) -> Iterator[TDataItem]:
+    resource = None
+    limit = None
+    try:
+        resource = dlt.current.resource()
+        limit = resource.limit
+        resource_columns_hints_require_data = callable(resource.columns)
+        if resource_columns_hints_require_data and backend == "pyarrow":
+            table_name = table.name if isinstance(table, Table) else table
+            logger.warning(
+                f"Dynamic column hints for '{table_name}' cannot be applied with pyarrow "
+                "backend. Use static hints (dict/list) to override reflected types."
+            )
+    except DltException:
+        # in old versions of dlt, resource is not available, so we need to reflect the table again
+        pass
     if isinstance(table, str):  # Reflection is deferred
         table = Table(
             table,
@@ -297,39 +342,49 @@ def table_rows(
         )
 
         # set the primary_key in the incremental
+        # TODO: check for primary key in resource._hints
         if incremental and incremental.primary_key is None:
             primary_key = hints["primary_key"]
             if primary_key is not None:
                 incremental.primary_key = primary_key
 
-        # yield empty record to set hints
+        # Merge resource hints with reflection hints before yielding
+        if resource and hints.get("columns") and not callable(resource.columns):
+            hints["columns"] = merge_columns(hints["columns"], resource.columns)
+
+        # yield empty record to set hints and create schema
+        # Note: Empty list [] will be written as typed-jsonl (object format), but actual
+        # data rows will be written in their native format (e.g., parquet for arrow backend).
         yield dlt.mark.with_hints(
             [],
             dlt.mark.make_hints(
                 **hints,
             ),
         )
+        # Set columns_hints for TableLoader
+        columns_hints = hints["columns"]
     else:
-        # table was already reflected
-        hints = table_to_resource_hints(
-            table,
-            reflection_level,
-            type_adapter_callback,
-            backend == "sqlalchemy",  # skip nested types
-            resolve_foreign_keys=resolve_foreign_keys,
-        )
+        # table was already reflected -> try to use resource hints
+        if not resource or callable(resource.columns):
+            hints = table_to_resource_hints(
+                table,
+                reflection_level,
+                type_adapter_callback,
+                backend == "sqlalchemy",  # skip nested types
+                resolve_foreign_keys=resolve_foreign_keys,
+            )
+            columns_hints = hints["columns"]
 
-    limit = None
-    try:
-        limit = dlt.current.resource().limit
-    except DltException:
-        pass
+        else:
+            # take column hints from resource (which includes user applied hints)
+            # Handle callable columns hint (can't resolve without data item)
+            columns_hints = resource.columns
 
     loader = TableLoader(
         engine,
         backend,
         table,
-        hints["columns"],
+        columns_hints,
         incremental=incremental,
         chunk_size=chunk_size,
         limit=limit,
@@ -451,3 +506,38 @@ class SqlTableResourceConfiguration(BaseConfiguration):
     write_disposition: Optional[TWriteDispositionDict] = None
     primary_key: Optional[TColumnNames] = None
     merge_key: Optional[TColumnNames] = None
+
+
+def _oracle_column_reflect_listener(
+    inspector: Any, table: Any, column_info: Dict[str, Any]
+) -> None:
+    """
+    SQLAlchemy event listener for `column_reflect` that enforces Oracle NUMBER type
+    to translate to python decimal.Decimal.
+
+    Oracle NUMBER may express floating- or fixed-point numbers, but floats
+    don't conform to IEEE754 standard, so we're always using "decimal" type
+    to preserve values as accurately as possible. SQLAlchemy2 uses different
+    logic for determining asdecimal, we're overriding it here.
+    """
+    column_type = column_info.get("type")
+    if isinstance(column_type, ORACLE_NUMBER):
+        column_info["type"] = ORACLE_NUMBER(
+            precision=column_type.precision,
+            scale=column_type.scale,
+            asdecimal=True,
+        )
+
+
+def default_engine_adapter_callback(engine: Engine, metadata: MetaData) -> None:
+    """Applies default engine adaptations for known dialects.
+
+    For Oracle dialect, registers an event listener on the provided MetaData that forces
+    NUMBER columns to be reflected as Python Decimal to preserve numeric precision.
+
+    Args:
+        engine: The SQLAlchemy engine to check dialect for.
+        metadata: The MetaData instance to register the listener on.
+    """
+    if isinstance(engine.dialect, OracleDialect):
+        sa.event.listen(metadata, "column_reflect", _oracle_column_reflect_listener)

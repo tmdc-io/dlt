@@ -44,60 +44,36 @@ has-uv:
 	uv --version
 
 dev: has-uv
-	uv sync --all-extras --group docs --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
+	uv sync --all-extras --no-extra hub --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
 
 dev-airflow: has-uv
-	uv sync --all-extras --group docs --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group airflow
-	
-lint:
-	uv run mypy --config-file mypy.ini dlt tests
+	uv sync --all-extras --no-extra hub --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group airflow
+
+dev-hub: has-uv
+	uv sync --all-extras --group dev --group providers --group pipeline --group sources --group sentry-sdk --group ibis --group adbc --group dashboard-tests
+
+format:
+	uv run black dlt tests tools --extend-exclude='.*syntax_error.py|_storage/.*'
+
+lint: lint-core lint-security lint-docstrings lint-lock
+
+lint-lock:
+	uv lock --check
+	uv run python tools/check_hub_extras.py
+
+lint-core:
+	uv run mypy --config-file mypy.ini dlt tests tools
 	# NOTE: we need to make sure docstring_parser_fork is the only version of docstring_parser installed
 	uv pip uninstall docstring_parser
 	uv pip install docstring_parser_fork --reinstall
 	uv run ruff check
 	# NOTE: we exclude all D lint errors (docstrings)
-	uv run flake8 --extend-ignore=D --max-line-length=200 dlt
+	uv run flake8 --extend-ignore=D --max-line-length=200 dlt tools
 	uv run flake8 --extend-ignore=D --max-line-length=200 tests --exclude tests/reflection/module_cases,tests/common/reflection/cases/modules/
-	uv run black dlt docs tests --check --diff --color --extend-exclude=".*syntax_error.py"
-	$(MAKE) lint-security
-	$(MAKE) lint-docstrings
-
-format:
-	uv run black dlt docs tests --extend-exclude='.*syntax_error.py|_storage/.*'
-	uv run black docs/education --ipynb --extend-exclude='.*syntax_error.py|_storage/.*'
-
-lint-snippets:
-	cd docs/tools && uv run python check_embedded_snippets.py full
-
-lint-and-test-snippets: lint-snippets
-	# TODO: re-enable transformation snippets tests
-	uv pip install docstring_parser_fork --reinstall
-	uv run mypy --config-file mypy.ini docs/website docs/tools --exclude docs/tools/lint_setup --exclude docs/website/docs_processed --exclude docs/website/versioned_docs/ --exclude docs/website/docs/general-usage/transformations/transformation-snippets.py
-	uv run ruff check
-	uv run flake8 --max-line-length=200 docs/website docs/tools --exclude docs/website/.dlt-repo --exclude docs/website/docs/general-usage/transformations/transformation-snippets.py
-	cd docs/website/docs && uv run pytest --ignore=node_modules --ignore general-usage/transformations/transformation-snippets.py
-
-lint-and-test-examples:
-	uv pip install docstring_parser_fork --reinstall
-	cd docs/tools && uv run python prepare_examples_tests.py
-	uv run ruff check
-	uv run flake8 --max-line-length=200 docs/examples
-	uv run mypy --config-file mypy.ini docs/examples
-	cd docs/examples && uv run pytest
-
-test-examples:
-	cd docs/examples && uv run pytest
 
 lint-security:
 	# go for ll by cleaning up eval and SQL warnings.
 	uv run bandit -r dlt/ -n 3 -lll
-
-lint-notebooks:
-	uv run nbqa flake8 docs/education --extend-ignore=D,F704 --max-line-length=200
-	uv run nbqa mypy docs/education \
-	--ignore-missing-imports \
-	--disable-error-code=no-redef \
-	--disable-error-code=top-level-await
 
 # check docstrings for all important public classes and functions
 lint-docstrings:
@@ -123,14 +99,9 @@ test-load-local-postgres:
 	DESTINATION__POSTGRES__CREDENTIALS=postgresql://loader:loader@localhost:5432/dlt_data ACTIVE_DESTINATIONS='["postgres"]' ALL_FILESYSTEM_DRIVERS='["memory"]'  uv run pytest tests/load
 
 test-common:
-	uv run pytest tests/common tests/normalize tests/extract tests/pipeline tests/reflection tests/sources tests/cli/common tests/load/test_dummy_client.py tests/libs tests/destinations
+	uv run pytest tests/common tests/normalize tests/extract tests/pipeline tests/reflection tests/sources tests/workspace tests/load/test_dummy_client.py tests/libs tests/destinations
 
-reset-test-storage:
-	-rm -r _storage
-	mkdir _storage
-	python3 tests/tools/create_storages.py
-
-build-library: dev
+build-library: dev lint-lock
 	uv version
 	uv build
 
@@ -139,22 +110,17 @@ clean-dist:
 
 publish-library: clean-dist build-library
 	ls -l dist/
-	@read -p "Enter PyPI API token: " PYPI_API_TOKEN; echo ; \
-	uv publish --token "$$PYPI_API_TOKEN"
+	@bash -c 'read -s -p "Enter PyPI API token: " PYPI_API_TOKEN; echo; \
+	uv publish --token "$$PYPI_API_TOKEN"'
 
 test-build-images: build-library
 	# NOTE: uv export does not work with our many different deps, we install a subset and freeze
-	uv sync --extra gcp --extra redshift --extra duckdb
-	uv pip freeze > _gen_requirements.txt
+	# uv sync --extra gcp --extra redshift --extra duckdb
+	# uv pip freeze > _gen_requirements.txt
 	# filter out libs that need native compilation
-	grep `cat compiled_packages.txt` _gen_requirements.txt > compiled_requirements.txt
+	# grep `cat compiled_packages.txt` _gen_requirements.txt > compiled_requirements.txt
 	docker build -f deploy/dlt/Dockerfile.airflow --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell uv version --short)" .
-    # enable when we upgrade arrow to 20.x
-    # docker build -f deploy/dlt/Dockerfile --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell uv version)" .
-
-preprocess-docs:
-	# run docs preprocessing to run a few checks and ensure examples can be parsed
-	cd docs/website && npm i && npm run preprocess-docs
+	docker build -f deploy/dlt/Dockerfile.minimal --build-arg=COMMIT_SHA="$(shell git log -1 --pretty=%h)" --build-arg=IMAGE_VERSION="$(shell uv version --short)" .
 
 start-test-containers:
 	docker compose -f "tests/load/dremio/docker-compose.yml" up -d
@@ -179,9 +145,6 @@ test-e2e-dashboard:
 test-e2e-dashboard-headed:
 	uv run pytest --headed --browser chromium tests/e2e
 
-start-dlt-dashboard-e2e:
-	uv run marimo run --headless dlt/helpers/dashboard/dlt_dashboard.py -- -- --pipelines-dir _storage/.dlt/pipelines --with_test_identifiers true
-
-# creates the dashboard test pipelines globally for manual testingn of the dashboard app and cli
+# creates the dashboard test pipelines globally for manual testing of the dashboard app and cli
 create-test-pipelines:
-	uv run python tests/helpers/dashboard/example_pipelines.py
+	uv run python tests/workspace/helpers/dashboard/example_pipelines.py
