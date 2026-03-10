@@ -278,11 +278,6 @@ def _load_catalog_from_pyiceberg(
             " variables found."
         )
 
-    apikey = os.environ.get("DATAOS_RUN_AS_APIKEY")
-    if apikey:
-        logger.debug("Injecting DATAOS API key header into pyiceberg catalog load.")
-        return load_catalog(catalog_name, **{"header.apikey": apikey})
-
     return load_catalog(catalog_name)
 
 
@@ -321,12 +316,6 @@ def _load_catalog_from_config(
         raise CatalogNotFoundError("No configuration dictionary provided")
 
     logger.info(f"Loading catalog '{catalog_name}' from provided configuration")
-
-    if "header.apikey" not in config_dict:
-        apikey = os.environ.get("DATAOS_RUN_AS_APIKEY")
-        if apikey:
-            logger.debug("Injecting DATAOS API key header into explicit catalog config.")
-            config_dict["header.apikey"] = apikey
 
     if credentials:
         config_dict.update(_get_fileio_config(credentials))
