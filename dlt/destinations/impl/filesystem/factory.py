@@ -1,3 +1,5 @@
+import os
+
 from typing import Any, Optional, Type, Union, Dict, TYPE_CHECKING, Sequence, Tuple
 
 from dlt.common.destination import Destination, DestinationCapabilitiesContext, TLoaderFileFormat
@@ -7,6 +9,8 @@ from dlt.common.storages.configuration import FileSystemCredentials
 
 from dlt.destinations.impl.filesystem.configuration import FilesystemDestinationClientConfiguration
 from dlt.destinations.impl.filesystem.typing import TCurrentDateTime, TExtraPlaceholders
+
+DEFAULT_FILE_ROTATION_SIZE = 128 * 1024 * 1024  # 128 MB
 
 if TYPE_CHECKING:
     from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
@@ -71,6 +75,7 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
         caps.enforces_nulls_on_alter = False
         caps.sqlglot_dialect = "duckdb"
         caps.supports_nested_types = True
+        caps.recommended_file_size = int(os.environ.get("FILESYSTEM_FILE_ROTATION_SIZE", DEFAULT_FILE_ROTATION_SIZE))
 
         return caps
 
