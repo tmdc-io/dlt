@@ -25,6 +25,8 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
     """Maximum number of pipeline state files to keep; 0 or negative value disables cleanup."""
     always_refresh_views: bool = False
     """Always refresh table scanner views by setting the newest table metadata or globbing table files"""
+    iceberg_gc_collect_interval: int = 0
+    """How often (in batches) to run gc.collect() during streamed Iceberg writes. Set to 0 to disable."""
 
     @resolve_type("credentials")
     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:

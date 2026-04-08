@@ -71,6 +71,7 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
         caps.enforces_nulls_on_alter = False
         caps.sqlglot_dialect = "duckdb"
         caps.supports_nested_types = True
+        caps.recommended_file_size = 128 * 1024 * 1024
 
         return caps
 
