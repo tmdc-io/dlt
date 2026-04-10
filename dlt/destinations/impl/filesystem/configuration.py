@@ -27,6 +27,10 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
     """Always refresh table scanner views by setting the newest table metadata or globbing table files"""
     iceberg_gc_collect_interval: int = 0
     """How often (in batches) to run gc.collect() during streamed Iceberg writes. Set to 0 to disable."""
+    iceberg_merge_engine: str = "pyiceberg"
+    """Engine to use for Iceberg merge/upsert: 'pyiceberg' (default, single-process) or 'spark' (distributed via PySpark MERGE INTO)."""
+    spark_catalog_name: str = "rest"
+    """Spark Iceberg catalog name (used when iceberg_merge_engine='spark')."""
 
     @resolve_type("credentials")
     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:
