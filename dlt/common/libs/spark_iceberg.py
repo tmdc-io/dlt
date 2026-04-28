@@ -2,20 +2,206 @@
 
 Replaces PyIceberg's single-process paths with distributed Spark execution.
 
-Requires ``pyspark`` and the Iceberg Spark runtime JAR to be available in the
-environment (already present in ``tabulario/spark-iceberg`` Docker images).
+Requires ``pyspark``. The Iceberg Spark runtime + AWS bundle JARs are pulled
+from Maven Central on first SparkSession creation via ``spark.jars.packages``
+(cached in ``~/.ivy2``). Override via the env vars below if needed:
+
+- ``DLT_ICEBERG_SPARK_PACKAGES`` — full comma-separated Maven coords list.
+- ``DLT_ICEBERG_VERSION`` — Iceberg version (default ``1.10.1``).
+- ``DLT_ICEBERG_SPARK_RUNTIME`` — Spark+Scala suffix (default ``4.0_2.13``).
 """
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import os
+import re
+import tempfile
+import threading
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
 from dlt.common import logger
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+
+
+_DEFAULT_ICEBERG_VERSION = "1.10.1"
+_DEFAULT_SPARK_RUNTIME = "4.0_2.13"
+
+#: Directories scanned (in order) by :func:`_find_cached_iceberg_jars` for
+#: pre-staged Iceberg Spark JARs. Public — callers can prepend their own
+#: paths to ship JARs from inside a package without going through ``~/.ivy2``.
+#: Example::
+#:
+#:     from dlt.common.libs import spark_iceberg
+#:     spark_iceberg.ICEBERG_JARS_DIRS.insert(0, Path("/app/nilus/iceberg_jars"))
+ICEBERG_JARS_DIRS: List[Path] = [
+    Path.home() / ".ivy2.5.2" / "jars",
+    Path.home() / ".ivy2" / "jars",
+]
+
+
+def _iceberg_jar_specs() -> List[Tuple[str, str, str]]:
+    """Return (group, artifact, version) tuples for required Iceberg JARs."""
+    iceberg_version = os.environ.get("DLT_ICEBERG_VERSION", _DEFAULT_ICEBERG_VERSION)
+    spark_runtime = os.environ.get("DLT_ICEBERG_SPARK_RUNTIME", _DEFAULT_SPARK_RUNTIME)
+    return [
+        ("org.apache.iceberg", f"iceberg-spark-runtime-{spark_runtime}", iceberg_version),
+        ("org.apache.iceberg", "iceberg-aws-bundle", iceberg_version),
+    ]
+
+
+def _resolve_iceberg_packages() -> str:
+    """Maven coordinates for Iceberg Spark runtime + AWS bundle."""
+    explicit = os.environ.get("DLT_ICEBERG_SPARK_PACKAGES")
+    if explicit:
+        return explicit
+    return ",".join(f"{g}:{a}:{v}" for g, a, v in _iceberg_jar_specs())
+
+
+def _find_cached_iceberg_jars() -> Optional[List[str]]:
+    """If all required Iceberg JARs already live on disk, return their paths.
+
+    Scans :data:`ICEBERG_JARS_DIRS` in order. Using ``spark.jars`` with file
+    paths instead of ``spark.jars.packages`` skips Spark's Ivy resolver
+    entirely, removing the noisy bootstrap output. Returns ``None`` if any
+    JAR is missing, so the caller falls back to Maven.
+    """
+    if os.environ.get("DLT_ICEBERG_SKIP_JAR_CACHE", "").lower() in {"1", "true", "yes"}:
+        return None
+
+    found: List[str] = []
+    for group, artifact, version in _iceberg_jar_specs():
+        candidate = None
+        for jar_dir in ICEBERG_JARS_DIRS:
+            patterns = [
+                jar_dir / f"{group}_{artifact}-{version}.jar",
+                jar_dir / f"{artifact}-{version}.jar",
+            ]
+            for p in patterns:
+                if p.is_file():
+                    candidate = str(p)
+                    break
+            if candidate:
+                break
+            glob_hits = glob.glob(str(jar_dir / f"*{artifact}*{version}*.jar"))
+            if glob_hits:
+                candidate = glob_hits[0]
+                break
+        if not candidate:
+            return None
+        found.append(candidate)
+    return found
+
+
+_QUIET_LOG4J2_PROPERTIES = """\
+status = error
+name = dlt-iceberg-quiet
+appenders = console
+appender.console.type = Console
+appender.console.name = console
+appender.console.target = SYSTEM_ERR
+appender.console.layout.type = PatternLayout
+appender.console.layout.pattern = %d{yy/MM/dd HH:mm:ss} %p %c{1}: %m%n%ex
+rootLogger.level = error
+rootLogger.appenderRefs = console
+rootLogger.appenderRef.console.ref = console
+"""
+
+
+def _ensure_quiet_log4j_config() -> str:
+    """Write a quiet log4j2 config to a stable temp path and return its file URL.
+
+    Providing this file via ``-Dlog4j2.configurationFile=...`` stops Spark from
+    falling back to its built-in defaults, which are the source of the noisy
+    "Using Spark's default log4j profile / Setting default log level" stderr
+    prints. Cached on disk so we do not rewrite on every call.
+    """
+    target = Path(tempfile.gettempdir()) / "dlt-spark-iceberg-log4j2.properties"
+    if not target.is_file():
+        target.write_text(_QUIET_LOG4J2_PROPERTIES)
+    return target.as_uri()
+
+
+# Lines that Spark / the JVM hardcode to System.err and cannot be silenced via
+# log4j2 config. We drop them at the OS file descriptor level (see
+# ``_filter_jvm_stderr``); everything else is written through unchanged.
+_JVM_NOISE_PATTERNS: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r'^Setting default log level to "'),
+    re.compile(r"^To adjust logging level use sc\.setLogLevel"),
+    re.compile(r'^Setting Spark log level to "'),
+    re.compile(r"^WARNING: Using incubator modules: jdk\.incubator\.vector"),
+    re.compile(r"^WARN(?:ING)? NativeCodeLoader: "),
+    re.compile(r"^Using Spark's default log4j profile"),
+)
+
+
+def _is_jvm_noise(line: str) -> bool:
+    return any(p.search(line) for p in _JVM_NOISE_PATTERNS)
+
+
+@contextlib.contextmanager
+def _filter_jvm_stderr() -> Iterator[None]:
+    """Drop a known-noisy subset of JVM/Spark stderr lines.
+
+    Spark's ``SparkContext`` init and the JVM print messages directly via
+    ``System.err`` that bypass log4j entirely (e.g. ``Setting default log
+    level to "WARN"``). They cannot be suppressed through configuration, so we
+    swap fd 2 with a pipe, run a pump thread that filters lines, and write
+    survivors back to the real stderr. Set
+    ``DLT_ICEBERG_NO_STDERR_FILTER=1`` to disable.
+    """
+    if os.environ.get("DLT_ICEBERG_NO_STDERR_FILTER", "").lower() in {"1", "true", "yes"}:
+        yield
+        return
+
+    try:
+        saved_stderr_fd = os.dup(2)
+    except OSError:
+        yield
+        return
+
+    r_fd, w_fd = os.pipe()
+    os.dup2(w_fd, 2)
+    os.close(w_fd)
+
+    stop_event = threading.Event()
+
+    def _pump() -> None:
+        buf = b""
+        try:
+            with os.fdopen(r_fd, "rb", buffering=0) as r:
+                while True:
+                    try:
+                        chunk = r.read(4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not _is_jvm_noise(line.decode("utf-8", "replace")):
+                            os.write(saved_stderr_fd, line + b"\n")
+                if buf and not _is_jvm_noise(buf.decode("utf-8", "replace")):
+                    os.write(saved_stderr_fd, buf)
+        finally:
+            stop_event.set()
+
+    pump = threading.Thread(target=_pump, name="dlt-spark-stderr-filter", daemon=True)
+    pump.start()
+    try:
+        yield
+    finally:
+        # Restore stderr; the pipe's last writer reference (fd 2) now drops,
+        # giving the reader EOF so the pump thread can exit cleanly.
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+        stop_event.wait(timeout=2)
 
 
 def _build_spark_session(
@@ -30,6 +216,19 @@ def _build_spark_session(
     """
     from pyspark.sql import SparkSession
 
+    quiet_log4j_uri = _ensure_quiet_log4j_config()
+    log4j_jvm_opt = f"-Dlog4j2.configurationFile={quiet_log4j_uri}"
+
+    # In Spark local mode the driver JVM is spawned by ``spark-submit`` before
+    # SparkConf is consulted, so ``spark.driver.extraJavaOptions`` is silently
+    # ignored. We have to slip the log4j override into ``PYSPARK_SUBMIT_ARGS``
+    # via ``--driver-java-options`` so it is picked up at JVM launch.
+    existing_submit_args = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
+    if "log4j2.configurationFile" not in existing_submit_args:
+        os.environ["PYSPARK_SUBMIT_ARGS"] = (
+            f'--driver-java-options="{log4j_jvm_opt}" {existing_submit_args}'
+        )
+
     builder = (
         SparkSession.builder
         .master("local[1]")
@@ -40,7 +239,17 @@ def _build_spark_session(
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
         .config("spark.sql.defaultCatalog", catalog_name)
+        .config("spark.log.level", "ERROR")
+        .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.driver.extraJavaOptions", log4j_jvm_opt)
+        .config("spark.executor.extraJavaOptions", log4j_jvm_opt)
     )
+
+    cached_jars = _find_cached_iceberg_jars()
+    if cached_jars:
+        builder = builder.config("spark.jars", ",".join(cached_jars))
+    else:
+        builder = builder.config("spark.jars.packages", _resolve_iceberg_packages())
 
     cfg = catalog_config or {}
 
@@ -58,6 +267,13 @@ def _build_spark_session(
     s3_region = cfg.get("s3.region") or os.environ.get("AWS_REGION", "us-east-1")
     s3_path_style = cfg.get("s3.path-style-access", "true")
 
+    rest_apikey_header = (
+        cfg.get("header.apikey")
+        or os.environ.get("PYICEBERG_CATALOG__DEFAULT__HEADER__APIKEY")
+        or os.environ.get("DATAOS_RUN_AS_APIKEY")
+        or ""
+    )
+
     spark_confs: Dict[str, str] = {
         f"spark.sql.catalog.{catalog_name}": "org.apache.iceberg.spark.SparkCatalog",
         f"spark.sql.catalog.{catalog_name}.catalog-impl": "org.apache.iceberg.rest.RESTCatalog",
@@ -68,6 +284,7 @@ def _build_spark_session(
         f"spark.sql.catalog.{catalog_name}.s3.access-key-id": s3_access_key,
         f"spark.sql.catalog.{catalog_name}.s3.secret-access-key": s3_secret_key,
         f"spark.sql.catalog.{catalog_name}.s3.path-style-access": str(s3_path_style),
+        f"spark.sql.catalog.{catalog_name}.header.apikey": rest_apikey_header,
         "spark.hadoop.fs.s3a.endpoint": s3_endpoint,
         "spark.hadoop.fs.s3a.access.key": s3_access_key,
         "spark.hadoop.fs.s3a.secret.key": s3_secret_key,
@@ -80,8 +297,8 @@ def _build_spark_session(
         if v:
             builder = builder.config(k, v)
 
-    spark = builder.getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
+    with _filter_jvm_stderr():
+        spark = builder.getOrCreate()
     return spark
 
 
@@ -104,7 +321,7 @@ def merge_iceberg_table_spark(
     spark = _build_spark_session(catalog_name, catalog_config)
     full_table = f"{catalog_name}.{table_id}"
 
-    py_catalog = load_catalog("default")
+    py_catalog = load_catalog("default", **(catalog_config or {}))
     py_table = py_catalog.load_table(table_id)
     original_snapshot = py_table.current_snapshot()
     original_snapshot_id = original_snapshot.snapshot_id if original_snapshot else None
