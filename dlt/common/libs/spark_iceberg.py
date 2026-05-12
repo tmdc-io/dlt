@@ -338,7 +338,18 @@ def _build_spark_session(
 
     cached_jars = _find_cached_iceberg_jars(cloud)
     if cached_jars:
-        builder = builder.config("spark.jars", ",".join(cached_jars))
+        jars_csv = ",".join(cached_jars)
+        builder = builder.config("spark.jars", jars_csv)
+        # In Spark local mode, ``spark.jars`` populates the executor classpath
+        # only AFTER the JVM has launched, so any class loaded during driver
+        # bootstrap (e.g. ``org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem``
+        # discovered via Hadoop's FileSystem registry) hits a
+        # ``ClassNotFoundException``. ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` is
+        # consumed by ``spark-submit`` BEFORE the JVM starts, so the same
+        # cached jars get prepended to the driver classpath at launch.
+        submit_args_now = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
+        if "--jars" not in submit_args_now:
+            os.environ["PYSPARK_SUBMIT_ARGS"] = f"--jars {jars_csv} {submit_args_now}"
     else:
         builder = builder.config("spark.jars.packages", _resolve_iceberg_packages(cloud))
 
