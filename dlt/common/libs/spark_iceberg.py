@@ -411,6 +411,24 @@ def _cloud_spark_confs(
 
         confs: Dict[str, str] = {
             f"{cat_prefix}.io-impl": "org.apache.iceberg.azure.adlsv2.ADLSFileIO",
+            # Hadoop FS class registrations for ``abfss://`` / ``abfs://``.
+            # Without these Spark throws ``ClassNotFoundException`` when
+            # ``ResolvingFileIO`` falls back to ``HadoopFileIO`` for ADLS Gen2
+            # paths. The auto-discovery via ``core-default.xml`` inside
+            # ``hadoop-azure.jar`` is shadowed by Spark's bundled
+            # ``hadoop-client-api`` jar, so we register them explicitly.
+            "spark.hadoop.fs.abfss.impl": (
+                "org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem"
+            ),
+            "spark.hadoop.fs.abfs.impl": (
+                "org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem"
+            ),
+            "spark.hadoop.fs.AbstractFileSystem.abfss.impl": (
+                "org.apache.hadoop.fs.azurebfs.Abfss"
+            ),
+            "spark.hadoop.fs.AbstractFileSystem.abfs.impl": (
+                "org.apache.hadoop.fs.azurebfs.Abfs"
+            ),
         }
         if account:
             confs[f"{cat_prefix}.adls.account-name"] = account
