@@ -35,6 +35,12 @@ if TYPE_CHECKING:
 _DEFAULT_ICEBERG_VERSION = "1.10.1"
 _DEFAULT_SPARK_RUNTIME = "4.0_2.13"
 
+# Default version of the Hadoop Azure FileSystem jar used when
+# ``ResolvingFileIO`` falls back to ``HadoopFileIO`` for ``abfss://`` paths.
+# Spark 4.x bundles Hadoop 3.4.x. Override via ``DLT_HADOOP_AZURE_VERSION`` if
+# you upgrade Spark/Hadoop.
+_DEFAULT_HADOOP_AZURE_VERSION = "3.4.1"
+
 #: Directories scanned (in order) by :func:`_find_cached_iceberg_jars` for
 #: pre-staged Iceberg Spark JARs. Public — callers can prepend their own
 #: paths to ship JARs from inside a package without going through ``~/.ivy2``.
@@ -75,11 +81,42 @@ def _detect_cloud(warehouse_uri: str) -> str:
     return "s3"
 
 
+def _hadoop_fs_specs(cloud: str) -> List[Tuple[str, str, str]]:
+    """Return Hadoop FileSystem support jars needed for ``cloud``.
+
+    Iceberg's ``ResolvingFileIO`` only auto-routes ``s3://``/``gs://`` to its
+    native FileIOs. For ``abfss://`` it falls back to ``HadoopFileIO`` which
+    needs Hadoop's Azure FileSystem implementation (``hadoop-azure``). The
+    ``iceberg-azure-bundle`` does NOT include this — it only ships Iceberg's
+    native ``ADLSFileIO``.
+
+    For ABFSS-only workloads, ``hadoop-azure`` is the only extra jar
+    required: its other compile-scope deps (``azure-storage``,
+    ``jetty-util-ajax``, ``wildfly-openssl``) are needed only by the legacy
+    ``wasb://`` code paths or for optional native-OpenSSL TLS acceleration,
+    neither of which apply to modern Azure (ADLS Gen2) deployments.
+
+    Returns an empty list for clouds where Spark's bundled Hadoop already
+    has the FileSystem class (``s3a`` is provided by ``hadoop-aws`` which is
+    typically bundled, and ``iceberg-aws-bundle`` covers Iceberg's S3FileIO).
+    """
+    if cloud != "azure":
+        return []
+
+    hadoop_azure = os.environ.get(
+        "DLT_HADOOP_AZURE_VERSION", _DEFAULT_HADOOP_AZURE_VERSION
+    )
+    return [
+        ("org.apache.hadoop", "hadoop-azure", hadoop_azure),
+    ]
+
+
 def _iceberg_jar_specs(cloud: str) -> List[Tuple[str, str, str]]:
     """Return (group, artifact, version) tuples for required Iceberg JARs.
 
-    Always includes the Spark runtime; appends the cloud-specific bundle when
-    one exists for ``cloud``.
+    Always includes the Spark runtime; appends the cloud-specific Iceberg
+    bundle when one exists for ``cloud``, and any extra Hadoop FileSystem
+    support jars (e.g. ``hadoop-azure`` for ``abfss://``).
     """
     iceberg_version = os.environ.get("DLT_ICEBERG_VERSION", _DEFAULT_ICEBERG_VERSION)
     spark_runtime = os.environ.get("DLT_ICEBERG_SPARK_RUNTIME", _DEFAULT_SPARK_RUNTIME)
@@ -89,6 +126,7 @@ def _iceberg_jar_specs(cloud: str) -> List[Tuple[str, str, str]]:
     bundle = _CLOUD_BUNDLE.get(cloud)
     if bundle:
         specs.append(("org.apache.iceberg", bundle, iceberg_version))
+    specs.extend(_hadoop_fs_specs(cloud))
     return specs
 
 
