@@ -116,6 +116,12 @@ def write_iceberg_table(
 ) -> None:
     start_ts = precise_time()
 
+    mode = "streamed" if isinstance(data, pa.RecordBatchReader) else "in-memory"
+    logger.info(
+        f"[pyiceberg-write] enter"
+        f" table={table.name()} disposition={write_disposition} mode={mode}"
+    )
+
     if isinstance(data, pa.RecordBatchReader):
         _write_iceberg_table_streamed(
             table, data, write_disposition, gc_collect_interval=gc_collect_interval
@@ -269,6 +275,11 @@ def merge_iceberg_table(
     Accepts pa.Table or streaming RecordBatchReader.
     """
     strategy = schema["x-merge-strategy"]  # type: ignore[typeddict-item]
+    mode = "streamed" if isinstance(data, pa.RecordBatchReader) else "in-memory"
+    logger.info(
+        f"[pyiceberg-merge] enter"
+        f" table={load_table_name} strategy={strategy} mode={mode}"
+    )
     if strategy in ("upsert", "insert-only"):
         arrow_schema = ensure_iceberg_compatible_arrow_schema(data.schema)
 

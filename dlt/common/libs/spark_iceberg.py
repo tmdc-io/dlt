@@ -2,11 +2,13 @@
 
 Replaces PyIceberg's single-process paths with distributed Spark execution.
 
-Requires ``pyspark``. The Iceberg Spark runtime + AWS bundle JARs are pulled
-from Maven Central on first SparkSession creation via ``spark.jars.packages``
-(cached in ``~/.ivy2``). Override via the env vars below if needed:
+Requires ``pyspark``. Cloud-specific Iceberg bundle JARs are pulled from Maven
+Central on first SparkSession creation via ``spark.jars.packages`` (cached in
+``~/.ivy2``). The cloud backend (S3/Azure/GCS/local) is auto-detected from the
+warehouse URL scheme. Override via the env vars below if needed:
 
-- ``DLT_ICEBERG_SPARK_PACKAGES`` — full comma-separated Maven coords list.
+- ``DLT_ICEBERG_SPARK_PACKAGES`` — full comma-separated Maven coords list
+  (skips auto-detection entirely).
 - ``DLT_ICEBERG_VERSION`` — Iceberg version (default ``1.10.1``).
 - ``DLT_ICEBERG_SPARK_RUNTIME`` — Spark+Scala suffix (default ``4.0_2.13``).
 """
@@ -20,6 +22,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
@@ -45,25 +48,59 @@ ICEBERG_JARS_DIRS: List[Path] = [
 ]
 
 
-def _iceberg_jar_specs() -> List[Tuple[str, str, str]]:
-    """Return (group, artifact, version) tuples for required Iceberg JARs."""
+_CLOUD_BUNDLE: Dict[str, Optional[str]] = {
+    "s3": "iceberg-aws-bundle",
+    "azure": "iceberg-azure-bundle",
+    "gcs": "iceberg-gcp-bundle",
+    "local": None,
+}
+
+
+def _detect_cloud(warehouse_uri: str) -> str:
+    """Detect cloud backend from warehouse URI scheme.
+
+    Returns one of: ``s3``, ``azure``, ``gcs``, ``local``. Defaults to ``s3``
+    when scheme is unknown to preserve backward compatibility with existing
+    S3-only setups.
+    """
+    uri = (warehouse_uri or "").lower().strip()
+    if uri.startswith(("s3://", "s3a://", "s3n://")):
+        return "s3"
+    if uri.startswith(("abfss://", "abfs://", "wasbs://", "wasb://")):
+        return "azure"
+    if uri.startswith("gs://"):
+        return "gcs"
+    if uri.startswith(("file://", "/")) or not uri:
+        return "local"
+    return "s3"
+
+
+def _iceberg_jar_specs(cloud: str) -> List[Tuple[str, str, str]]:
+    """Return (group, artifact, version) tuples for required Iceberg JARs.
+
+    Always includes the Spark runtime; appends the cloud-specific bundle when
+    one exists for ``cloud``.
+    """
     iceberg_version = os.environ.get("DLT_ICEBERG_VERSION", _DEFAULT_ICEBERG_VERSION)
     spark_runtime = os.environ.get("DLT_ICEBERG_SPARK_RUNTIME", _DEFAULT_SPARK_RUNTIME)
-    return [
+    specs: List[Tuple[str, str, str]] = [
         ("org.apache.iceberg", f"iceberg-spark-runtime-{spark_runtime}", iceberg_version),
-        ("org.apache.iceberg", "iceberg-aws-bundle", iceberg_version),
     ]
+    bundle = _CLOUD_BUNDLE.get(cloud)
+    if bundle:
+        specs.append(("org.apache.iceberg", bundle, iceberg_version))
+    return specs
 
 
-def _resolve_iceberg_packages() -> str:
-    """Maven coordinates for Iceberg Spark runtime + AWS bundle."""
+def _resolve_iceberg_packages(cloud: str) -> str:
+    """Maven coordinates for Iceberg Spark runtime + cloud-specific bundle."""
     explicit = os.environ.get("DLT_ICEBERG_SPARK_PACKAGES")
     if explicit:
         return explicit
-    return ",".join(f"{g}:{a}:{v}" for g, a, v in _iceberg_jar_specs())
+    return ",".join(f"{g}:{a}:{v}" for g, a, v in _iceberg_jar_specs(cloud))
 
 
-def _find_cached_iceberg_jars() -> Optional[List[str]]:
+def _find_cached_iceberg_jars(cloud: str) -> Optional[List[str]]:
     """If all required Iceberg JARs already live on disk, return their paths.
 
     Scans :data:`ICEBERG_JARS_DIRS` in order. Using ``spark.jars`` with file
@@ -75,7 +112,7 @@ def _find_cached_iceberg_jars() -> Optional[List[str]]:
         return None
 
     found: List[str] = []
-    for group, artifact, version in _iceberg_jar_specs():
+    for group, artifact, version in _iceberg_jar_specs(cloud):
         candidate = None
         for jar_dir in ICEBERG_JARS_DIRS:
             patterns = [
@@ -245,28 +282,12 @@ def _build_spark_session(
         .config("spark.executor.extraJavaOptions", log4j_jvm_opt)
     )
 
-    cached_jars = _find_cached_iceberg_jars()
-    if cached_jars:
-        builder = builder.config("spark.jars", ",".join(cached_jars))
-    else:
-        builder = builder.config("spark.jars.packages", _resolve_iceberg_packages())
-
     cfg = catalog_config or {}
 
     cat_uri = cfg.get("uri") or os.environ.get("PYICEBERG_CATALOG__DEFAULT__URI", "")
     cat_warehouse = cfg.get("warehouse") or os.environ.get(
         "PYICEBERG_CATALOG__DEFAULT__WAREHOUSE", ""
     )
-    s3_endpoint = cfg.get("s3.endpoint") or os.environ.get(
-        "PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT", ""
-    )
-    s3_access_key = cfg.get("s3.access-key-id") or os.environ.get("AWS_ACCESS_KEY_ID", "")
-    s3_secret_key = cfg.get("s3.secret-access-key") or os.environ.get(
-        "AWS_SECRET_ACCESS_KEY", ""
-    )
-    s3_region = cfg.get("s3.region") or os.environ.get("AWS_REGION", "us-east-1")
-    s3_path_style = cfg.get("s3.path-style-access", "true")
-
     rest_apikey_header = (
         cfg.get("header.apikey")
         or os.environ.get("PYICEBERG_CATALOG__DEFAULT__HEADER__APIKEY")
@@ -274,24 +295,23 @@ def _build_spark_session(
         or ""
     )
 
+    cloud = _detect_cloud(cat_warehouse)
+    logger.debug(f"[spark-iceberg] Detected cloud backend: {cloud} (warehouse={cat_warehouse!r})")
+
+    cached_jars = _find_cached_iceberg_jars(cloud)
+    if cached_jars:
+        builder = builder.config("spark.jars", ",".join(cached_jars))
+    else:
+        builder = builder.config("spark.jars.packages", _resolve_iceberg_packages(cloud))
+
     spark_confs: Dict[str, str] = {
         f"spark.sql.catalog.{catalog_name}": "org.apache.iceberg.spark.SparkCatalog",
         f"spark.sql.catalog.{catalog_name}.catalog-impl": "org.apache.iceberg.rest.RESTCatalog",
         f"spark.sql.catalog.{catalog_name}.uri": cat_uri,
         f"spark.sql.catalog.{catalog_name}.warehouse": cat_warehouse,
-        f"spark.sql.catalog.{catalog_name}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
-        f"spark.sql.catalog.{catalog_name}.s3.endpoint": s3_endpoint,
-        f"spark.sql.catalog.{catalog_name}.s3.access-key-id": s3_access_key,
-        f"spark.sql.catalog.{catalog_name}.s3.secret-access-key": s3_secret_key,
-        f"spark.sql.catalog.{catalog_name}.s3.path-style-access": str(s3_path_style),
         f"spark.sql.catalog.{catalog_name}.header.apikey": rest_apikey_header,
-        "spark.hadoop.fs.s3a.endpoint": s3_endpoint,
-        "spark.hadoop.fs.s3a.access.key": s3_access_key,
-        "spark.hadoop.fs.s3a.secret.key": s3_secret_key,
-        "spark.hadoop.fs.s3a.path.style.access": str(s3_path_style),
-        "spark.hadoop.fs.s3a.region": s3_region,
-        "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
     }
+    spark_confs.update(_cloud_spark_confs(cloud, catalog_name, cfg))
 
     for k, v in spark_confs.items():
         if v:
@@ -302,6 +322,202 @@ def _build_spark_session(
     return spark
 
 
+def _cloud_spark_confs(
+    cloud: str, catalog_name: str, cfg: Dict[str, Any]
+) -> Dict[str, str]:
+    """Cloud-specific Spark/Hadoop properties for the Iceberg catalog.
+
+    Returns FileIO impl + Hadoop FS credentials for the detected backend.
+    Reads from ``cfg`` first (PyIceberg catalog config), then falls back to
+    standard cloud env vars (``AWS_*``, ``AZURE_*``, ``GOOGLE_*``).
+    """
+    cat_prefix = f"spark.sql.catalog.{catalog_name}"
+
+    if cloud == "s3":
+        endpoint = cfg.get("s3.endpoint") or os.environ.get(
+            "PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT", ""
+        )
+        access_key = cfg.get("s3.access-key-id") or os.environ.get("AWS_ACCESS_KEY_ID", "")
+        secret_key = cfg.get("s3.secret-access-key") or os.environ.get(
+            "AWS_SECRET_ACCESS_KEY", ""
+        )
+        region = cfg.get("s3.region") or os.environ.get("AWS_REGION", "us-east-1")
+        path_style = str(cfg.get("s3.path-style-access", "true"))
+        return {
+            f"{cat_prefix}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+            f"{cat_prefix}.s3.endpoint": endpoint,
+            f"{cat_prefix}.s3.access-key-id": access_key,
+            f"{cat_prefix}.s3.secret-access-key": secret_key,
+            f"{cat_prefix}.s3.path-style-access": path_style,
+            "spark.hadoop.fs.s3a.endpoint": endpoint,
+            "spark.hadoop.fs.s3a.access.key": access_key,
+            "spark.hadoop.fs.s3a.secret.key": secret_key,
+            "spark.hadoop.fs.s3a.path.style.access": path_style,
+            "spark.hadoop.fs.s3a.region": region,
+            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        }
+
+    if cloud == "azure":
+        # ADLS Gen2 (abfss://) — preferred. account.key OR sas.token OR
+        # connection-string can be supplied via cfg or env.
+        account = cfg.get("adls.account-name") or os.environ.get(
+            "AZURE_STORAGE_ACCOUNT_NAME", ""
+        )
+        account_key = cfg.get("adls.account-key") or os.environ.get(
+            "AZURE_STORAGE_ACCOUNT_KEY", ""
+        )
+        sas_token = cfg.get("adls.sas-token") or os.environ.get("AZURE_STORAGE_SAS_TOKEN", "")
+        conn_string = cfg.get("adls.connection-string") or os.environ.get(
+            "AZURE_STORAGE_CONNECTION_STRING", ""
+        )
+
+        confs: Dict[str, str] = {
+            f"{cat_prefix}.io-impl": "org.apache.iceberg.azure.adlsv2.ADLSFileIO",
+        }
+        if account:
+            confs[f"{cat_prefix}.adls.account-name"] = account
+        if account_key:
+            confs[f"{cat_prefix}.adls.account-key"] = account_key
+            if account:
+                confs[f"spark.hadoop.fs.azure.account.key.{account}.dfs.core.windows.net"] = (
+                    account_key
+                )
+        if sas_token:
+            confs[f"{cat_prefix}.adls.sas-token"] = sas_token
+            if account:
+                confs[f"spark.hadoop.fs.azure.sas.fixed.token.{account}.dfs.core.windows.net"] = (
+                    sas_token
+                )
+        if conn_string:
+            confs[f"{cat_prefix}.adls.connection-string"] = conn_string
+        return confs
+
+    if cloud == "gcs":
+        project_id = cfg.get("gcs.project-id") or os.environ.get(
+            "GOOGLE_CLOUD_PROJECT", ""
+        )
+        creds_path = cfg.get("gcs.credentials-path") or os.environ.get(
+            "GOOGLE_APPLICATION_CREDENTIALS", ""
+        )
+        confs = {
+            f"{cat_prefix}.io-impl": "org.apache.iceberg.gcp.gcs.GCSFileIO",
+        }
+        if project_id:
+            confs[f"{cat_prefix}.gcs.project-id"] = project_id
+            confs["spark.hadoop.fs.gs.project.id"] = project_id
+        if creds_path:
+            confs[f"{cat_prefix}.gcs.service-account-key-file"] = creds_path
+            confs["spark.hadoop.google.cloud.auth.service.account.json.keyfile"] = (
+                creds_path
+            )
+        confs["spark.hadoop.fs.gs.impl"] = (
+            "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem"
+        )
+        return confs
+
+    # Local filesystem — Iceberg picks the right FileIO automatically.
+    return {f"{cat_prefix}.io-impl": "org.apache.iceberg.io.ResolvingFileIO"}
+
+
+@contextlib.contextmanager
+def _wap_session(
+    spark: "SparkSession",
+    full_table: str,
+    table_id: str,
+    catalog_name: str,
+    py_table: Any,
+    op: str,
+) -> Iterator[str]:
+    """Run a block of writes against an isolated Iceberg WAP staging branch.
+
+    Yields the branch name. All writes inside the ``with`` block are routed
+    to the staging branch via ``spark.wap.branch``. On clean exit, every
+    snapshot created on the branch (since the base) is published onto
+    ``main`` via ``system.cherrypick_snapshot`` — this is the canonical
+    WAP publish that does NOT require an ancestor relationship. On
+    exception the branch is dropped and ``main`` is left untouched —
+    readers never observe partial state.
+
+    First-time tables (no prior snapshot) get a no-op seed snapshot so a
+    branch can be created. On failure such tables are visible as empty,
+    never partially populated.
+    """
+    logger.info(f"[wap] enter op={op!r} table={full_table!r}")
+    # Iceberg silently ignores spark.wap.branch unless this table property is
+    # set. Without it Spark writes to main and the staging branch stays empty,
+    # silently breaking atomicity. Set idempotently on every run.
+    spark.sql(
+        f"ALTER TABLE {full_table} SET TBLPROPERTIES ('write.wap.enabled'='true')"
+    )
+
+    if py_table.current_snapshot() is None:
+        logger.info(f"[{op}] First run on empty table — committing seed snapshot")
+        spark.sql(f"INSERT INTO {full_table} SELECT * FROM {full_table} WHERE 1 = 0")
+        py_table.refresh()
+
+    base_snapshot_id = py_table.current_snapshot().snapshot_id
+    # Branch name must be unique across concurrent loads. dlt's loader uses a
+    # thread pool, so multiple jobs in the same process can hit this within the
+    # same wall-clock second — pid+time alone collides. Add thread id + a 6-hex
+    # uuid suffix to make it collision-proof.
+    wap_branch = (
+        f"dlt_wap_{int(time.time())}"
+        f"_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:6]}"
+    )
+
+    logger.info(
+        f"[{op}] Creating staging branch {wap_branch!r} from snapshot "
+        f"{base_snapshot_id} (main left untouched until success)"
+    )
+    spark.sql(f"ALTER TABLE {full_table} CREATE BRANCH {wap_branch}")
+    spark.conf.set("spark.wap.branch", wap_branch)
+
+    try:
+        yield wap_branch
+        spark.conf.unset("spark.wap.branch")
+
+        # With write.wap.enabled=true, every staged commit on the branch chains
+        # onto the base snapshot — so the branch IS a descendant of main and
+        # fast_forward is valid. This is a SINGLE atomic ref-pointer move at
+        # the catalog level: main jumps from base → branch.head in one commit.
+        # No partial state is possible: either the publish succeeds and ALL
+        # batches are visible, or it fails and main stays at base. Compare
+        # cherrypick_snapshot which is one commit per staged snapshot (N calls,
+        # mid-process death = partial main).
+        py_table.refresh()
+        branch_snap = py_table.snapshot_by_name(wap_branch)
+        if branch_snap is None or branch_snap.snapshot_id == base_snapshot_id:
+            logger.info(f"[{op}] No new snapshots on staging branch — nothing to publish")
+        else:
+            logger.info(
+                f"[{op}] Publishing branch {wap_branch!r} onto main via fast_forward "
+                f"(branch head = {branch_snap.snapshot_id}, base = {base_snapshot_id}) — "
+                f"single atomic commit"
+            )
+            spark.sql(
+                f"CALL {catalog_name}.system.fast_forward("
+                f"table => '{table_id}', branch => 'main', to => '{wap_branch}')"
+            )
+    except Exception:
+        logger.error(
+            f"[{op}] Operation failed — discarding staging branch {wap_branch!r}. "
+            f"Main remains at snapshot {base_snapshot_id}."
+        )
+        raise
+    finally:
+        try:
+            spark.conf.unset("spark.wap.branch")
+        except Exception:
+            pass
+        try:
+            spark.sql(f"ALTER TABLE {full_table} DROP BRANCH IF EXISTS {wap_branch}")
+        except Exception as cleanup_err:
+            logger.warning(
+                f"[{op}] Failed to drop staging branch {wap_branch!r}: "
+                f"{cleanup_err}. Branch can be removed manually."
+            )
+
+
 def merge_iceberg_table_spark(
     file_paths: List[str],
     table_id: str,
@@ -310,11 +526,11 @@ def merge_iceberg_table_spark(
     catalog_config: Optional[Dict[str, Any]] = None,
     batch_size: int = 2,
 ) -> None:
-    """Run ``MERGE INTO`` on an Iceberg table via Spark.
+    """Run ``MERGE INTO`` on an Iceberg table via Spark, atomically.
 
-    Processes files in batches to avoid OOM.  Records the current snapshot
-    before starting; if any batch fails the table is rolled back to the
-    original snapshot via PyIceberg so the operation is all-or-nothing.
+    All per-batch MERGE statements run inside :func:`_wap_session`, so the
+    operation is fully all-or-nothing — readers either see all merged rows
+    or none.
     """
     from pyiceberg.catalog import load_catalog
 
@@ -323,13 +539,6 @@ def merge_iceberg_table_spark(
 
     py_catalog = load_catalog("default", **(catalog_config or {}))
     py_table = py_catalog.load_table(table_id)
-    original_snapshot = py_table.current_snapshot()
-    original_snapshot_id = original_snapshot.snapshot_id if original_snapshot else None
-
-    if original_snapshot_id:
-        logger.info(
-            f"[spark-merge] Saved rollback point: snapshot {original_snapshot_id}"
-        )
 
     target_cols = [c for c in spark.table(full_table).columns]
     non_pk = [c for c in target_cols if c not in join_cols]
@@ -350,12 +559,12 @@ def merge_iceberg_table_spark(
     t0 = time.time()
     total_rows = 0
     n_files = len(file_paths)
+    total_batches = (n_files + batch_size - 1) // batch_size
 
-    try:
+    with _wap_session(spark, full_table, table_id, catalog_name, py_table, "spark-merge") as wap_branch:
         for i in range(0, n_files, batch_size):
             batch = file_paths[i : i + batch_size]
             batch_num = i // batch_size + 1
-            total_batches = (n_files + batch_size - 1) // batch_size
 
             try:
                 updates = spark.read.parquet(*batch)
@@ -365,7 +574,8 @@ def merge_iceberg_table_spark(
 
                 logger.info(
                     f"[spark-merge] Batch {batch_num}/{total_batches}: "
-                    f"MERGE {batch_rows:,} rows from {len(batch)} file(s)"
+                    f"MERGE {batch_rows:,} rows from {len(batch)} file(s) → "
+                    f"branch {wap_branch!r}"
                 )
                 spark.sql(merge_sql)
                 logger.info(f"[spark-merge] Batch {batch_num} done")
@@ -376,20 +586,6 @@ def merge_iceberg_table_spark(
                     spark.catalog.dropTempView("__dlt_spark_updates")
                 except Exception:
                     pass
-    except Exception:
-        if original_snapshot_id:
-            logger.error(
-                f"[spark-merge] Merge failed — rolling back to snapshot "
-                f"{original_snapshot_id}"
-            )
-            py_table.refresh()
-            py_table.manage_snapshots().set_current_snapshot(
-                original_snapshot_id
-            ).commit()
-            logger.info("[spark-merge] Rollback complete")
-        else:
-            logger.error("[spark-merge] Merge failed — no snapshot to rollback to")
-        raise
 
     elapsed = time.time() - t0
     logger.info(
@@ -406,41 +602,56 @@ def write_iceberg_table_spark(
     catalog_config: Optional[Dict[str, Any]] = None,
     batch_size: int = 5,
 ) -> None:
-    """Append or replace data in an Iceberg table via Spark.
+    """Append or replace data in an Iceberg table via Spark, atomically.
 
-    Processes files in batches to avoid OOM in memory-constrained environments.
+    Both ``append`` and ``replace`` are routed through :func:`_wap_session`,
+    so partial-write states are never visible to readers. ``replace`` first
+    deletes existing data on the staging branch, then appends new batches;
+    on success ``main`` is fast-forwarded in a single atomic commit.
+
+    Files are processed in batches of ``batch_size`` to bound peak memory.
     """
+    from pyiceberg.catalog import load_catalog
+
     spark = _build_spark_session(catalog_name, catalog_config)
     full_table = f"{catalog_name}.{table_id}"
 
+    py_catalog = load_catalog("default", **(catalog_config or {}))
+    py_table = py_catalog.load_table(table_id)
+
+    op = "spark-write"
     t0 = time.time()
     total_rows = 0
     n_files = len(file_paths)
+    total_batches = (n_files + batch_size - 1) // batch_size
 
-    if write_disposition == "replace":
-        logger.info(f"[spark-write] REPLACE: loading all {n_files} file(s) at once")
-        df = spark.read.parquet(*file_paths)
-        df.writeTo(full_table).overwritePartitions()
-        total_rows = df.count()
-    else:
+    with _wap_session(spark, full_table, table_id, catalog_name, py_table, op) as wap_branch:
+        if write_disposition == "replace":
+            logger.info(
+                f"[{op}] REPLACE on branch {wap_branch!r}: deleting existing rows"
+            )
+            spark.sql(f"DELETE FROM {full_table} WHERE TRUE")
+
         for i in range(0, n_files, batch_size):
             batch = file_paths[i : i + batch_size]
             batch_num = i // batch_size + 1
-            total_batches = (n_files + batch_size - 1) // batch_size
-            logger.info(
-                f"[spark-write] Batch {batch_num}/{total_batches}: "
-                f"{len(batch)} file(s) [{i+1}-{min(i+batch_size, n_files)}/{n_files}]"
-            )
+
             df = spark.read.parquet(*batch)
-            df.writeTo(full_table).append()
             batch_rows = df.count()
             total_rows += batch_rows
+
+            logger.info(
+                f"[{op}] Batch {batch_num}/{total_batches}: APPEND "
+                f"{batch_rows:,} rows from {len(batch)} file(s) → "
+                f"branch {wap_branch!r}"
+            )
+            df.writeTo(full_table).append()
             del df
             spark.catalog.clearCache()
-            logger.info(f"[spark-write] Batch {batch_num} done: {batch_rows:,} rows appended")
+            logger.info(f"[{op}] Batch {batch_num} done")
 
     elapsed = time.time() - t0
     logger.info(
-        f"[spark-write] {write_disposition.upper()} completed in {elapsed:.1f}s "
+        f"[{op}] {write_disposition.upper()} completed in {elapsed:.1f}s "
         f"({total_rows:,} rows, {n_files} files)"
     )
