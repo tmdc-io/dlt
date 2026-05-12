@@ -339,14 +339,29 @@ def _build_spark_session(
     cached_jars = _find_cached_iceberg_jars(cloud)
     if cached_jars:
         jars_csv = ",".join(cached_jars)
-        builder = builder.config("spark.jars", jars_csv)
-        # In Spark local mode, ``spark.jars`` populates the executor classpath
-        # only AFTER the JVM has launched, so any class loaded during driver
-        # bootstrap (e.g. ``org.apache.hadoop.fs.azurebfs.SecureAzureBlobFileSystem``
-        # discovered via Hadoop's FileSystem registry) hits a
-        # ``ClassNotFoundException``. ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` is
-        # consumed by ``spark-submit`` BEFORE the JVM starts, so the same
-        # cached jars get prepended to the driver classpath at launch.
+        # In Spark ``local[*]`` mode the driver JVM is spawned in-process by
+        # PySpark before SparkConf is consulted, and ``spark.jars`` only
+        # populates the *executor* classpath AFTER the JVM has launched. So any
+        # class the driver tries to resolve at bootstrap (e.g.
+        # ``SecureAzureBlobFileSystem`` via Hadoop's FileSystem registry) hits
+        # a ``ClassNotFoundException``. We have to register the jars on the
+        # driver classpath itself, in three places to cover every possible
+        # path Spark/Hadoop uses to load classes:
+        #   1. ``spark.jars`` — required for executors and Spark internals.
+        #   2. ``spark.driver.extraClassPath`` — explicit driver classpath
+        #      entries; honoured even in local mode.
+        #   3. ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` — consumed by
+        #      ``spark-submit`` BEFORE the JVM starts, so jars are present
+        #      on the JVM classpath at launch (belt-and-suspenders for
+        #      classloaders that ignore ``extraClassPath``).
+        cp_sep = os.pathsep  # ":" on Linux/macOS, ";" on Windows
+        cp_string = cp_sep.join(cached_jars)
+        builder = (
+            builder
+            .config("spark.jars", jars_csv)
+            .config("spark.driver.extraClassPath", cp_string)
+            .config("spark.executor.extraClassPath", cp_string)
+        )
         submit_args_now = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
         if "--jars" not in submit_args_now:
             os.environ["PYSPARK_SUBMIT_ARGS"] = f"--jars {jars_csv} {submit_args_now}"
