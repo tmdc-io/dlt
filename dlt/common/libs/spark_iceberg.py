@@ -19,6 +19,7 @@ import contextlib
 import glob
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -136,6 +137,64 @@ def _resolve_iceberg_packages(cloud: str) -> str:
     if explicit:
         return explicit
     return ",".join(f"{g}:{a}:{v}" for g, a, v in _iceberg_jar_specs(cloud))
+
+
+def _stage_jars_into_spark_home(jars: List[str]) -> bool:
+    """Symlink (or copy) ``jars`` into ``$SPARK_HOME/jars/``.
+
+    This is the most robust way to put extra JARs on Spark's classpath.
+    ``$SPARK_HOME/jars/`` is loaded by Spark's bootstrap launcher onto the
+    JVM system classloader BEFORE PySpark, before any user code, before any
+    SparkConf is read. Every classloader Spark creates afterwards (driver
+    classloader, executor MutableURLClassLoader, REPL classloader,
+    Hadoop's ``Configuration.classLoader``) chains to it as parent and
+    therefore sees these classes.
+
+    Why this matters: in Spark ``local[*]`` mode, ``spark.executor.extraClassPath``
+    set programmatically via ``SparkConf`` is silently ignored — the local
+    executor reuses the driver JVM but takes its classpath from the launcher,
+    not from the conf. That is why ``HadoopFileIO`` fails with
+    ``ClassNotFoundException: SecureAzureBlobFileSystem`` on the executor
+    side even when the driver-side ``FileSystem.get()`` works.
+
+    Returns ``True`` if every jar is now present in ``$SPARK_HOME/jars/``,
+    ``False`` if the directory is unknown / not writable / a copy fails. The
+    caller should fall back to ``spark.jars`` + ``spark.driver.extraClassPath``
+    + ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` in that case.
+    """
+    spark_home_str = os.environ.get("SPARK_HOME")
+    if not spark_home_str:
+        try:
+            from pyspark import find_spark_home as _fsh
+
+            spark_home_str = _fsh._find_spark_home()  # type: ignore[attr-defined]
+        except Exception:
+            return False
+
+    spark_jars_dir = Path(spark_home_str) / "jars"
+    if not spark_jars_dir.is_dir() or not os.access(spark_jars_dir, os.W_OK):
+        return False
+
+    for jar_path in jars:
+        src = Path(jar_path)
+        if not src.is_file():
+            return False
+        target = spark_jars_dir / src.name
+        if target.exists() or target.is_symlink():
+            try:
+                if target.resolve() == src.resolve():
+                    continue
+            except OSError:
+                pass
+            continue
+        try:
+            target.symlink_to(src.resolve())
+        except OSError:
+            try:
+                shutil.copy2(src, target)
+            except OSError:
+                return False
+    return True
 
 
 def _find_cached_iceberg_jars(cloud: str) -> Optional[List[str]]:
@@ -338,33 +397,48 @@ def _build_spark_session(
 
     cached_jars = _find_cached_iceberg_jars(cloud)
     if cached_jars:
-        jars_csv = ",".join(cached_jars)
-        # In Spark ``local[*]`` mode the driver JVM is spawned in-process by
-        # PySpark before SparkConf is consulted, and ``spark.jars`` only
-        # populates the *executor* classpath AFTER the JVM has launched. So any
-        # class the driver tries to resolve at bootstrap (e.g.
-        # ``SecureAzureBlobFileSystem`` via Hadoop's FileSystem registry) hits
-        # a ``ClassNotFoundException``. We have to register the jars on the
-        # driver classpath itself, in three places to cover every possible
-        # path Spark/Hadoop uses to load classes:
-        #   1. ``spark.jars`` — required for executors and Spark internals.
-        #   2. ``spark.driver.extraClassPath`` — explicit driver classpath
-        #      entries; honoured even in local mode.
-        #   3. ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` — consumed by
-        #      ``spark-submit`` BEFORE the JVM starts, so jars are present
-        #      on the JVM classpath at launch (belt-and-suspenders for
-        #      classloaders that ignore ``extraClassPath``).
-        cp_sep = os.pathsep  # ":" on Linux/macOS, ";" on Windows
-        cp_string = cp_sep.join(cached_jars)
-        builder = (
-            builder
-            .config("spark.jars", jars_csv)
-            .config("spark.driver.extraClassPath", cp_string)
-            .config("spark.executor.extraClassPath", cp_string)
-        )
-        submit_args_now = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
-        if "--jars" not in submit_args_now:
-            os.environ["PYSPARK_SUBMIT_ARGS"] = f"--jars {jars_csv} {submit_args_now}"
+        # Try the bulletproof path first: stage jars into ``$SPARK_HOME/jars/``.
+        # That directory is loaded onto the JVM system classloader by Spark's
+        # launcher BEFORE PySpark / SparkConf / executor setup runs, so every
+        # classloader (driver, executor in local mode, Hadoop's
+        # ``Configuration.classLoader``) sees the classes unconditionally.
+        # This is the only mechanism that survives Spark ``local[*]`` mode's
+        # well-known habit of silently dropping ``spark.executor.extraClassPath``
+        # set via ``SparkConf`` — see :func:`_stage_jars_into_spark_home` for
+        # the gory details.
+        staged = _stage_jars_into_spark_home(cached_jars)
+        if staged:
+            logger.info(
+                f"[spark-iceberg] Staged {len(cached_jars)} jar(s) into "
+                f"$SPARK_HOME/jars (bootstrap classpath)"
+            )
+        else:
+            # Fallback: register the jars via every Spark/JVM mechanism we can.
+            # Each of these covers a different classloader path; we set all
+            # three because no single one works in every Spark mode.
+            #   1. ``spark.jars`` — Spark internals + executor (cluster mode).
+            #   2. ``spark.driver.extraClassPath`` — explicit driver classpath.
+            #   3. ``--jars`` on ``PYSPARK_SUBMIT_ARGS`` — consumed by
+            #      ``spark-submit`` BEFORE the JVM starts, so jars hit the
+            #      JVM classpath at launch.
+            jars_csv = ",".join(cached_jars)
+            cp_sep = os.pathsep  # ":" on Linux/macOS, ";" on Windows
+            cp_string = cp_sep.join(cached_jars)
+            builder = (
+                builder
+                .config("spark.jars", jars_csv)
+                .config("spark.driver.extraClassPath", cp_string)
+                .config("spark.executor.extraClassPath", cp_string)
+            )
+            submit_args_now = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
+            if "--jars" not in submit_args_now:
+                os.environ["PYSPARK_SUBMIT_ARGS"] = f"--jars {jars_csv} {submit_args_now}"
+            logger.warning(
+                f"[spark-iceberg] $SPARK_HOME/jars staging unavailable — "
+                f"falling back to spark.jars + extraClassPath + --jars "
+                f"({len(cached_jars)} jar(s)). In Spark local mode this may "
+                f"not reach the executor classloader."
+            )
     else:
         builder = builder.config("spark.jars.packages", _resolve_iceberg_packages(cloud))
 
