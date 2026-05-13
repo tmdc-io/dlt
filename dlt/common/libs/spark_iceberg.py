@@ -530,22 +530,33 @@ def _cloud_spark_confs(
                 "org.apache.hadoop.fs.azurebfs.Abfs"
             ),
         }
+        # Iceberg's ADLSFileIO uses these EXACT property names (see
+        # ``org.apache.iceberg.azure.AzureProperties``). Earlier we used
+        # convenience names like ``adls.account-name`` which ADLSFileIO
+        # silently ignored, causing it to fall through to
+        # ``DefaultAzureCredential`` (env vars / Azure CLI / managed
+        # identity) — all of which fail in a stock K8s pod with
+        # ``CredentialUnavailableException``. The SAS/connection-string
+        # variants are PER-ACCOUNT and require the
+        # ``<account>.dfs.core.windows.net`` suffix to be honored.
         if account:
-            confs[f"{cat_prefix}.adls.account-name"] = account
+            confs[f"{cat_prefix}.adls.auth.shared-key.account.name"] = account
         if account_key:
-            confs[f"{cat_prefix}.adls.account-key"] = account_key
             if account:
+                confs[f"{cat_prefix}.adls.auth.shared-key.account.key"] = account_key
+                # Hadoop fallback (only used if Iceberg routes via HadoopFileIO).
                 confs[f"spark.hadoop.fs.azure.account.key.{account}.dfs.core.windows.net"] = (
                     account_key
                 )
-        if sas_token:
-            confs[f"{cat_prefix}.adls.sas-token"] = sas_token
-            if account:
-                confs[f"spark.hadoop.fs.azure.sas.fixed.token.{account}.dfs.core.windows.net"] = (
-                    sas_token
-                )
-        if conn_string:
-            confs[f"{cat_prefix}.adls.connection-string"] = conn_string
+        if sas_token and account:
+            confs[f"{cat_prefix}.adls.sas-token.{account}.dfs.core.windows.net"] = sas_token
+            confs[f"spark.hadoop.fs.azure.sas.fixed.token.{account}.dfs.core.windows.net"] = (
+                sas_token
+            )
+        if conn_string and account:
+            confs[f"{cat_prefix}.adls.connection-string.{account}.dfs.core.windows.net"] = (
+                conn_string
+            )
         return confs
 
     if cloud == "gcs":
