@@ -71,7 +71,20 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
         caps.enforces_nulls_on_alter = False
         caps.sqlglot_dialect = "duckdb"
         caps.supports_nested_types = True
+        caps.recommended_file_size = 128 * 1024 * 1024
 
+        return caps
+
+    @classmethod
+    def adjust_capabilities(
+        cls,
+        caps: DestinationCapabilitiesContext,
+        config: FilesystemDestinationClientConfiguration,
+        naming: Optional[Any] = None,
+    ) -> DestinationCapabilitiesContext:
+        caps = super().adjust_capabilities(caps, config, naming)
+        if config is not None:
+            caps.recommended_file_size = config.recommended_file_size
         return caps
 
     @property
