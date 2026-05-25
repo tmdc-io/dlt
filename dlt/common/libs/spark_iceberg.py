@@ -20,6 +20,7 @@ import glob
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -393,7 +394,7 @@ def _build_spark_session(
     )
 
     cloud = _detect_cloud(cat_warehouse)
-    logger.debug(f"[spark-iceberg] Detected cloud backend: {cloud} (warehouse={cat_warehouse!r})")
+    logger.debug(f"[spark-iceberg] Detected cloud backend: {cloud}")
 
     cached_jars = _find_cached_iceberg_jars(cloud)
     if cached_jars:
@@ -455,25 +456,6 @@ def _build_spark_session(
         if v:
             builder = builder.config(k, v)
 
-    # Diagnostic to stdout: show the auth-relevant Spark conf we end up
-    # with. Critical for debugging prod ``CredentialUnavailable`` errors:
-    # if the auth keys are missing here, the depot did not give us the
-    # creds. If they are present here but Iceberg still can't auth, the
-    # REST catalog server is overriding them.
-    auth_keys_emitted = sorted(
-        k for k, val in spark_confs.items()
-        if val and ("adls.auth" in k or "adls.sas-token" in k
-                    or "adls.connection-string" in k or "fs.azure" in k
-                    or "s3.access-key-id" in k or "fs.s3a.access" in k
-                    or "gcs.project-id" in k)
-    )
-    print(
-        f"[dlt][spark-iceberg] cloud={cloud} catalog={catalog_name} "
-        f"warehouse={cat_warehouse!r} "
-        f"auth_keys_in_spark_conf={auth_keys_emitted}",
-        flush=True,
-    )
-
     with _filter_jvm_stderr():
         spark = builder.getOrCreate()
     return spark
@@ -526,17 +508,6 @@ def _cloud_spark_confs(
         sas_token = cfg.get("adls.sas-token") or os.environ.get("AZURE_STORAGE_SAS_TOKEN", "")
         conn_string = cfg.get("adls.connection-string") or os.environ.get(
             "AZURE_STORAGE_CONNECTION_STRING", ""
-        )
-        # Diagnostic to stdout (DataOS captures stdout, not python logger).
-        # Helps distinguish "depot didn't pass creds" from "creds reached
-        # us but Iceberg ignored them".
-        print(
-            f"[dlt][spark-iceberg][azure-creds] cfg_keys={sorted(cfg.keys())} "
-            f"account={'<set>' if account else '<EMPTY>'} "
-            f"account_key={'<set>' if account_key else '<EMPTY>'} "
-            f"sas_token={'<set>' if sas_token else '<EMPTY>'} "
-            f"conn_string={'<set>' if conn_string else '<EMPTY>'}",
-            flush=True,
         )
 
         confs: Dict[str, str] = {
@@ -639,7 +610,6 @@ def _wap_session(
     branch can be created. On failure such tables are visible as empty,
     never partially populated.
     """
-    logger.info(f"[wap] enter op={op!r} table={full_table!r}")
     # Iceberg silently ignores spark.wap.branch unless this table property is
     # set. Without it Spark writes to main and the staging branch stays empty,
     # silently breaking atomicity. Set idempotently on every run.
@@ -775,7 +745,6 @@ def merge_iceberg_table_spark(
                     f"branch {wap_branch!r}"
                 )
                 spark.sql(merge_sql)
-                logger.info(f"[spark-merge] Batch {batch_num} done")
                 del updates
                 spark.catalog.clearCache()
             finally:
@@ -845,7 +814,6 @@ def write_iceberg_table_spark(
             df.writeTo(full_table).append()
             del df
             spark.catalog.clearCache()
-            logger.info(f"[{op}] Batch {batch_num} done")
 
     elapsed = time.time() - t0
     logger.info(
