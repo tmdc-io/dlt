@@ -74,7 +74,7 @@ def ensure_iceberg_compatible_arrow_data(data: pa.Table) -> pa.Table:
     return data.cast(schema)
 
 
-_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+_DEFAULT_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 def _upload_parquet_to_remote(
@@ -82,6 +82,7 @@ def _upload_parquet_to_remote(
     data_location: str,
     table_io: Any,
     prefix: str = "batch",
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> str:
     """Write an Arrow table to a temp Parquet file and upload it to remote storage."""
     import uuid
@@ -99,7 +100,7 @@ def _upload_parquet_to_remote(
     output = table_io.new_output(remote_path)
     with open(temp_path, "rb") as fh, output.create() as remote_file:
         while True:
-            chunk = fh.read(_UPLOAD_CHUNK_SIZE)
+            chunk = fh.read(upload_chunk_size)
             if not chunk:
                 break
             remote_file.write(chunk)
@@ -113,6 +114,7 @@ def write_iceberg_table(
     data: Union[pa.Table, pa.RecordBatchReader],
     write_disposition: TWriteDisposition,
     gc_collect_interval: int = 10,
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     start_ts = precise_time()
 
@@ -124,7 +126,11 @@ def write_iceberg_table(
 
     if isinstance(data, pa.RecordBatchReader):
         _write_iceberg_table_streamed(
-            table, data, write_disposition, gc_collect_interval=gc_collect_interval
+            table,
+            data,
+            write_disposition,
+            gc_collect_interval=gc_collect_interval,
+            upload_chunk_size=upload_chunk_size,
         )
     else:
         if write_disposition == "append":
@@ -143,6 +149,7 @@ def _write_iceberg_table_streamed(
     reader: pa.RecordBatchReader,
     write_disposition: TWriteDisposition,
     gc_collect_interval: int = 10,
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     """Streams Arrow batches as individual parquet files via Iceberg's IO,
     then does ONE atomic commit.
@@ -170,7 +177,11 @@ def _write_iceberg_table_streamed(
         data_files_desc = "via pyiceberg writer"
     else:
         total_rows, batch_count, n_files = _write_streamed_add_files(
-            table, reader, write_disposition, gc_collect_interval
+            table,
+            reader,
+            write_disposition,
+            gc_collect_interval,
+            upload_chunk_size=upload_chunk_size,
         )
         data_files_desc = f"{n_files} data files"
 
@@ -224,6 +235,7 @@ def _write_streamed_add_files(
     reader: pa.RecordBatchReader,
     write_disposition: TWriteDisposition,
     gc_collect_interval: int,
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> Tuple[int, int, int]:
     """Write streamed batches to an unpartitioned Iceberg table by manually
     writing parquet files and registering them via ``add_files``."""
@@ -238,7 +250,13 @@ def _write_streamed_add_files(
         batch_count += 1
         batch_table = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
         remote_paths.append(
-            _upload_parquet_to_remote(batch_table, data_location, table.io, prefix="batch")
+            _upload_parquet_to_remote(
+                batch_table,
+                data_location,
+                table.io,
+                prefix="batch",
+                upload_chunk_size=upload_chunk_size,
+            )
         )
         total_rows += batch_table.num_rows
         del batch_table
@@ -269,6 +287,7 @@ def merge_iceberg_table(
     schema: TTableSchema,
     load_table_name: str,
     gc_collect_interval: int = 10,
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     """Merges Arrow data into on-disk Iceberg table.
 
@@ -292,7 +311,12 @@ def merge_iceberg_table(
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
         _upsert_iceberg_table(
-            table, data, join_cols, strategy, gc_collect_interval=gc_collect_interval
+            table,
+            data,
+            join_cols,
+            strategy,
+            gc_collect_interval=gc_collect_interval,
+            upload_chunk_size=upload_chunk_size,
         )
     else:
         raise ValueError(
@@ -353,6 +377,7 @@ def _upsert_iceberg_table(
     join_cols: List[str],
     strategy: str,
     gc_collect_interval: int = 10,
+    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     """Upserts Arrow data into an Iceberg table with minimal snapshots.
 
@@ -401,7 +426,11 @@ def _upsert_iceberg_table(
                 else:
                     insert_paths.append(
                         _upload_parquet_to_remote(
-                            rows_to_insert, data_location, table.io, prefix="upsert"
+                            rows_to_insert,
+                            data_location,
+                            table.io,
+                            prefix="upsert",
+                            upload_chunk_size=upload_chunk_size,
                         )
                     )
 

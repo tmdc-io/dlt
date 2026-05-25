@@ -286,6 +286,8 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
         del schema
 
         gc_interval = self._job_client.config.iceberg_gc_collect_interval
+        upload_chunk_size = self._job_client.config.iceberg_upload_chunk_size
+        parquet_batch_size = self._job_client.config.iceberg_parquet_batch_size
         if gc_interval:
             gc.collect()
 
@@ -331,6 +333,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                         schema=self._load_table,
                         load_table_name=self.load_table_name,
                         gc_collect_interval=gc_interval,
+                        upload_chunk_size=upload_chunk_size,
                     )
                 del source_ds
         elif use_spark:
@@ -354,13 +357,18 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             )
             arrow_rbr = pa.RecordBatchReader.from_batches(
                 pq.read_schema(self.file_paths[0]),
-                self._iter_parquet_batches(self.file_paths, gc_collect_interval=gc_interval),
+                self._iter_parquet_batches(
+                    self.file_paths,
+                    batch_size=parquet_batch_size,
+                    gc_collect_interval=gc_interval,
+                ),
             )
             write_iceberg_table(
                 table=table,
                 data=arrow_rbr,
                 write_disposition=write_disposition,
                 gc_collect_interval=gc_interval,
+                upload_chunk_size=upload_chunk_size,
             )
 
         if gc_interval:
@@ -373,7 +381,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     @staticmethod
     def _iter_parquet_batches(
         file_paths: List[str],
-        batch_size: int = 10_000,
+        batch_size: int = 50_000,
         gc_collect_interval: int = 10,
     ) -> Iterator[Any]:
         """Yield Arrow batches from parquet files one at a time for constant memory."""
