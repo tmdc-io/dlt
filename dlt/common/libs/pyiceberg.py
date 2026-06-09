@@ -9,7 +9,6 @@ from packaging.version import Version
 from dlt import version
 from dlt.common import logger
 from dlt.common.time import precise_time
-from dlt.common.configuration import configspec
 from dlt.common.destination.exceptions import DestinationUndefinedEntity
 from dlt.common.libs.pyarrow import cast_arrow_schema_types
 from dlt.common.libs.utils import load_open_tables
@@ -19,9 +18,11 @@ from dlt.common.schema.utils import get_first_column_name_with_prop, get_columns
 from dlt.common.utils import assert_min_pkg_version
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.storages.configuration import FileSystemCredentials, FilesystemConfiguration
-from dlt.common.configuration.specs import BaseConfiguration, CredentialsConfiguration
+from dlt.common.configuration.specs import CredentialsConfiguration
 from dlt.common.configuration.specs.mixins import WithPyicebergConfig
 from dlt.common.configuration.inject import with_config
+from dlt.common.configuration import configspec
+from dlt.common.configuration.specs import BaseConfiguration
 
 from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 
@@ -74,7 +75,43 @@ def ensure_iceberg_compatible_arrow_data(data: pa.Table) -> pa.Table:
     return data.cast(schema)
 
 
-_DEFAULT_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+# Internal streaming constants — not public API, not environment-tunable.
+_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # read window when uploading a parquet file to remote IO
+_UPSERT_BATCH_ROWS = 1_000            # max rows per in-memory batch during merge/upsert
+_GC_INTERVAL_BATCHES = 10            # call gc.collect() every N batches to bound RSS growth
+
+
+def _inject_iceberg_field_ids(arrow_schema: pa.Schema, table: IcebergTable) -> pa.Schema:
+    """Return arrow_schema with Iceberg field-ID metadata and nullability injected per field.
+
+    add_files validates that parquet required/optional matches the Iceberg schema.
+    Primary-key and dlt internal columns are required in the Iceberg schema, so the
+    parquet fields must also be non-nullable. Field IDs are also needed so add_files
+    can map columns without falling back to name mapping.
+    """
+    try:
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+        iceberg_arrow = schema_to_pyarrow(table.schema())
+        iceberg_by_name = {f.name: f for f in iceberg_arrow}
+        new_fields = []
+        for f in arrow_schema:
+            iceberg_f = iceberg_by_name.get(f.name)
+            if iceberg_f is not None:
+                new_fields.append(
+                    pa.field(
+                        f.name,
+                        f.type,
+                        nullable=iceberg_f.nullable,
+                        metadata=iceberg_f.metadata or f.metadata,
+                    )
+                )
+            else:
+                new_fields.append(f)
+        return pa.schema(new_fields, metadata=arrow_schema.metadata)
+    except Exception as e:
+        logger.debug(f"pyiceberg: field-id injection skipped, falling back to name mapping: {e}")
+        return arrow_schema
 
 
 def _upload_parquet_to_remote(
@@ -82,39 +119,62 @@ def _upload_parquet_to_remote(
     data_location: str,
     table_io: Any,
     prefix: str = "batch",
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
+    iceberg_table: Optional[IcebergTable] = None,
+    upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
 ) -> str:
-    """Write an Arrow table to a temp Parquet file and upload it to remote storage."""
+    """Write an Arrow table to a temp Parquet file and upload it to remote storage.
+
+    If iceberg_table is provided, Iceberg field IDs are injected into the
+    Parquet schema metadata so add_files can match columns without a name mapping.
+    """
     import uuid
     import tempfile
 
     import pyarrow.parquet as pq
 
+    write_table = arrow_table
+    if iceberg_table is not None:
+        schema_with_ids = _inject_iceberg_field_ids(arrow_table.schema, iceberg_table)
+        if schema_with_ids is not arrow_table.schema:
+            write_table = pa.Table.from_arrays(
+                [arrow_table.column(name) for name in arrow_table.schema.names],
+                schema=schema_with_ids,
+            )
+
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
         temp_path = tmp.name
-    pq.write_table(
-        arrow_table, temp_path, compression="snappy", store_decimal_as_integer=True
-    )
+    try:
+        pq.write_table(
+            write_table, temp_path, compression="snappy", store_decimal_as_integer=True
+        )
 
-    remote_path = f"{data_location}/{prefix}-{uuid.uuid4()}.parquet"
-    output = table_io.new_output(remote_path)
-    with open(temp_path, "rb") as fh, output.create() as remote_file:
-        while True:
-            chunk = fh.read(upload_chunk_size)
-            if not chunk:
-                break
-            remote_file.write(chunk)
+        remote_path = f"{data_location}/{prefix}-{uuid.uuid4()}.parquet"
+        output = table_io.new_output(remote_path)
+        with open(temp_path, "rb") as fh, output.create() as remote_file:
+            while True:
+                chunk = fh.read(upload_chunk_bytes)
+                if not chunk:
+                    break
+                remote_file.write(chunk)
+    finally:
+        os.remove(temp_path)
 
-    os.remove(temp_path)
     return remote_path
+
+
+def _delete_files(table_io: Any, paths: List[str]) -> None:
+    """Best-effort delete of pre-written remote files on commit failure."""
+    for path in paths:
+        try:
+            table_io.delete(path)
+        except Exception as e:
+            logger.warning(f"pyiceberg: failed to delete orphan file {path}: {e}")
 
 
 def write_iceberg_table(
     table: IcebergTable,
     data: Union[pa.Table, pa.RecordBatchReader],
     write_disposition: TWriteDisposition,
-    gc_collect_interval: int = 10,
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     start_ts = precise_time()
 
@@ -125,13 +185,8 @@ def write_iceberg_table(
     )
 
     if isinstance(data, pa.RecordBatchReader):
-        _write_iceberg_table_streamed(
-            table,
-            data,
-            write_disposition,
-            gc_collect_interval=gc_collect_interval,
-            upload_chunk_size=upload_chunk_size,
-        )
+        _, upload_chunk_bytes = get_iceberg_config_tuning()
+        _write_iceberg_table_streamed(table, data, write_disposition, upload_chunk_bytes)
     else:
         if write_disposition == "append":
             table.append(ensure_iceberg_compatible_arrow_data(data))
@@ -148,45 +203,28 @@ def _write_iceberg_table_streamed(
     table: IcebergTable,
     reader: pa.RecordBatchReader,
     write_disposition: TWriteDisposition,
-    gc_collect_interval: int = 10,
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
+    upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
 ) -> None:
-    """Streams Arrow batches as individual parquet files via Iceberg's IO,
-    then does ONE atomic commit.
+    """Streams Arrow batches as individual parquet files via Iceberg's IO.
 
-    Memory stays constant: only one batch + one parquet file in memory at a
-    time.  Only lightweight file-path metadata is accumulated.
+    Memory stays constant: only one batch + one parquet file in memory at a time.
 
-    For unpartitioned tables, uses ``table.add_files`` for the commit so that
-    Iceberg field-ids and ``schema.name-mapping.default`` are handled correctly
-    by pyiceberg.
-
-    For partitioned tables, uses ``txn.append`` per batch so that pyiceberg
-    handles partition-aware file writing (``add_files`` requires each file to
-    contain data for exactly one partition value).
+    For unpartitioned tables: all files committed in ONE atomic snapshot via txn.add_files().
+    For partitioned tables: uses txn.append() per batch (partition-aware, multiple snapshots).
     """
-    import gc
-
     start_ts = precise_time()
     is_partitioned = table.spec() != UNPARTITIONED_PARTITION_SPEC
 
     if is_partitioned:
-        total_rows, batch_count = _write_streamed_partitioned(
-            table, reader, write_disposition, gc_collect_interval
+        total_rows, batch_count, data_files_desc = _write_streamed_partitioned(
+            table, reader, write_disposition
         )
-        data_files_desc = "via pyiceberg writer"
     else:
-        total_rows, batch_count, n_files = _write_streamed_add_files(
-            table,
-            reader,
-            write_disposition,
-            gc_collect_interval,
-            upload_chunk_size=upload_chunk_size,
+        total_rows, batch_count, n_files = _write_streamed_unpartitioned_atomic(
+            table, reader, write_disposition, upload_chunk_bytes
         )
-        data_files_desc = f"{n_files} data files"
+        data_files_desc = f"{n_files} data files (atomic)"
 
-    if gc_collect_interval:
-        gc.collect()
     logger.debug(
         f"pyiceberg: streamed {write_disposition} with {total_rows} rows in {batch_count}"
         f" batches ({data_files_desc}) to table {table.name()} at location"
@@ -198,10 +236,12 @@ def _write_streamed_partitioned(
     table: IcebergTable,
     reader: pa.RecordBatchReader,
     write_disposition: TWriteDisposition,
-    gc_collect_interval: int,
-) -> Tuple[int, int]:
-    """Write streamed batches to a partitioned Iceberg table using pyiceberg's
-    native writer (``txn.append``) which handles partition-aware file layout."""
+) -> Tuple[int, int, str]:
+    """Write streamed batches to a partitioned Iceberg table using txn.append().
+
+    Each batch creates its own snapshot (pyiceberg limitation), but partition-aware
+    file layout is handled correctly by pyiceberg's writer.
+    """
     import gc
 
     from pyiceberg.expressions import AlwaysTrue
@@ -220,65 +260,72 @@ def _write_streamed_partitioned(
             total_rows += batch_table.num_rows
             del batch_table
 
-            if gc_collect_interval and batch_count % gc_collect_interval == 0:
+            if batch_count % _GC_INTERVAL_BATCHES == 0:
                 gc.collect()
             if batch_count % 10 == 0:
                 logger.debug(
                     f"pyiceberg: streamed {batch_count} batches, {total_rows} rows so far"
                 )
 
-    return total_rows, batch_count
+    return total_rows, batch_count, "via pyiceberg writer (partition-aware)"
 
 
-def _write_streamed_add_files(
+def _write_streamed_unpartitioned_atomic(
     table: IcebergTable,
     reader: pa.RecordBatchReader,
     write_disposition: TWriteDisposition,
-    gc_collect_interval: int,
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
+    upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
 ) -> Tuple[int, int, int]:
-    """Write streamed batches to an unpartitioned Iceberg table by manually
-    writing parquet files and registering them via ``add_files``."""
+    """Write streamed batches to an unpartitioned Iceberg table, committed atomically.
+
+    Each batch is written to disk independently (constant memory), then all file
+    paths are registered in a single transaction commit. This ensures readers
+    never see partial writes.
+    """
     import gc
 
+    from pyiceberg.expressions import AlwaysTrue
+
     data_location = f"{table.location()}/data"
-    remote_paths: List[str] = []
+    accumulated_files: List[str] = []
     total_rows = 0
     batch_count = 0
 
-    for batch in reader:
-        batch_count += 1
-        batch_table = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
-        remote_paths.append(
-            _upload_parquet_to_remote(
+    try:
+        # Stream-write each batch to disk (constant memory per batch)
+        for batch in reader:
+            batch_count += 1
+            batch_table = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
+            file_path = _upload_parquet_to_remote(
                 batch_table,
                 data_location,
                 table.io,
                 prefix="batch",
-                upload_chunk_size=upload_chunk_size,
+                iceberg_table=table,
+                upload_chunk_bytes=upload_chunk_bytes,
             )
-        )
-        total_rows += batch_table.num_rows
-        del batch_table
+            accumulated_files.append(file_path)
+            total_rows += batch_table.num_rows
+            del batch_table
 
-        if gc_collect_interval and batch_count % gc_collect_interval == 0:
-            gc.collect()
-        if batch_count % 10 == 0:
-            logger.debug(
-                f"pyiceberg: streamed {batch_count} batches, {total_rows} rows so far"
-            )
+            if batch_count % _GC_INTERVAL_BATCHES == 0:
+                gc.collect()
+            if batch_count % 10 == 0:
+                logger.debug(
+                    f"pyiceberg: streamed {batch_count} batches, {total_rows} rows so far"
+                )
 
-    if write_disposition == "replace":
-        from pyiceberg.expressions import AlwaysTrue
-
+        # Atomic commit: all files registered in ONE snapshot
         with table.transaction() as txn:
-            if table.current_snapshot():
+            if write_disposition == "replace" and table.current_snapshot():
                 txn.delete(delete_filter=AlwaysTrue())
-            txn.add_files(remote_paths, check_duplicate_files=False)
-    else:
-        table.add_files(remote_paths, check_duplicate_files=False)
+            txn.add_files(accumulated_files, check_duplicate_files=False)
 
-    return total_rows, batch_count, len(remote_paths)
+    except Exception:
+        _delete_files(table.io, accumulated_files)
+        raise
+
+    return total_rows, batch_count, len(accumulated_files)
 
 
 def merge_iceberg_table(
@@ -286,8 +333,6 @@ def merge_iceberg_table(
     data: Union[pa.Table, pa.RecordBatchReader],
     schema: TTableSchema,
     load_table_name: str,
-    gc_collect_interval: int = 10,
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
 ) -> None:
     """Merges Arrow data into on-disk Iceberg table.
 
@@ -310,13 +355,13 @@ def merge_iceberg_table(
         else:
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
+        _, upload_chunk_bytes = get_iceberg_config_tuning()
         _upsert_iceberg_table(
             table,
             data,
             join_cols,
             strategy,
-            gc_collect_interval=gc_collect_interval,
-            upload_chunk_size=upload_chunk_size,
+            upload_chunk_bytes,
         )
     else:
         raise ValueError(
@@ -328,17 +373,20 @@ def merge_iceberg_table(
 def _process_upsert_batch(
     batch_tbl: pa.Table,
     table: IcebergTable,
-    txn: Any,
     join_cols: List[str],
     strategy: str,
     has_existing_data: bool,
-) -> Tuple[pa.Table, int]:
-    """Classify one batch into inserts/updates and apply updates via *txn*.
+) -> Tuple[pa.Table, Optional[pa.Table]]:
+    """Classify one batch into inserts and updates without applying either.
 
-    Returns ``(rows_to_insert, n_updated)``.
+    Returns ``(rows_to_insert, rows_to_update)``.
+    rows_to_update is None when strategy is 'insert-only' or there are no matches.
+    Keeping classification separate from writes lets the caller commit overwrite
+    and append in **separate transactions**, which is required to avoid SIGILL in
+    PyIceberg when two writer-style operations share one transaction.
     """
     if not has_existing_data:
-        return batch_tbl, 0
+        return batch_tbl, None
 
     from pyiceberg.table import upsert_util
     from pyiceberg.io.pyarrow import expression_to_pyarrow
@@ -349,15 +397,11 @@ def _process_upsert_batch(
         row_filter=matched_predicate, case_sensitive=True
     ).to_arrow()
 
-    n_updated = 0
+    rows_to_update: Optional[pa.Table] = None
     if strategy == "upsert":
-        rows_to_update = upsert_util.get_rows_to_update(
-            batch_tbl, matched_existing, join_cols
-        )
-        if len(rows_to_update) > 0:
-            overwrite_filter = upsert_util.create_match_filter(rows_to_update, join_cols)
-            txn.overwrite(rows_to_update, overwrite_filter=overwrite_filter)
-            n_updated = len(rows_to_update)
+        candidate = upsert_util.get_rows_to_update(batch_tbl, matched_existing, join_cols)
+        if len(candidate) > 0:
+            rows_to_update = candidate
 
     if len(matched_existing) > 0:
         expr_match = upsert_util.create_match_filter(matched_existing, join_cols)
@@ -368,7 +412,7 @@ def _process_upsert_batch(
         rows_to_insert = batch_tbl
 
     del matched_existing
-    return rows_to_insert, n_updated
+    return rows_to_insert, rows_to_update
 
 
 def _upsert_iceberg_table(
@@ -376,27 +420,22 @@ def _upsert_iceberg_table(
     data: Union[pa.Table, pa.RecordBatchReader],
     join_cols: List[str],
     strategy: str,
-    gc_collect_interval: int = 10,
-    upload_chunk_size: int = _DEFAULT_UPLOAD_CHUNK_SIZE,
+    upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
 ) -> None:
-    """Upserts Arrow data into an Iceberg table with minimal snapshots.
+    """Upserts Arrow data into an Iceberg table, one transaction per operation type per batch.
 
-    For unpartitioned tables, insert rows are written manually and registered
-    via ``txn.add_files`` in the same transaction as updates.
+    Overwrite and insert are always committed in **separate transactions** — even for
+    unpartitioned tables — because PyIceberg crashes (SIGILL) when two writer-style
+    operations (overwrite + append, or overwrite + add_files) share one transaction.
 
-    For partitioned tables, inserts are handled in a separate transaction
-    using ``txn.append`` because pyiceberg 0.9.x crashes (SIGILL) when
-    mixing writer-based operations (append/overwrite) with ``add_files``
-    or when issuing multiple writer operations in the same transaction.
+    Each batch is committed independently so later batches can observe earlier writes,
+    keeping duplicate keys that span batches correct.
     """
     import gc
+    from pyiceberg.table import upsert_util
 
     start_ts = precise_time()
-    has_existing_data = table.current_snapshot() is not None
     is_partitioned = table.spec() != UNPARTITIONED_PARTITION_SPEC
-    data_location = f"{table.location()}/data"
-    insert_paths: List[str] = []
-    partitioned_inserts: List[pa.Table] = []
     total_updated = 0
     total_inserted = 0
     batch_count = 0
@@ -404,53 +443,55 @@ def _upsert_iceberg_table(
     batches = (
         data
         if isinstance(data, pa.RecordBatchReader)
-        else data.to_batches(max_chunksize=1_000)
+        else data.to_batches(max_chunksize=_UPSERT_BATCH_ROWS)
     )
 
-    with table.transaction() as txn:
-        for batch in batches:
-            batch_count += 1
-            batch_tbl = ensure_iceberg_compatible_arrow_data(
-                pa.Table.from_batches([batch])
-            )
+    for batch in batches:
+        batch_count += 1
+        batch_tbl = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
+        has_existing_data = table.current_snapshot() is not None
 
-            rows_to_insert, n_updated = _process_upsert_batch(
-                batch_tbl, table, txn, join_cols, strategy, has_existing_data
-            )
-            total_updated += n_updated
+        rows_to_insert, rows_to_update = _process_upsert_batch(
+            batch_tbl, table, join_cols, strategy, has_existing_data
+        )
 
-            if len(rows_to_insert) > 0:
-                total_inserted += len(rows_to_insert)
-                if is_partitioned:
-                    partitioned_inserts.append(rows_to_insert)
-                else:
-                    insert_paths.append(
-                        _upload_parquet_to_remote(
-                            rows_to_insert,
-                            data_location,
-                            table.io,
-                            prefix="upsert",
-                            upload_chunk_size=upload_chunk_size,
-                        )
-                    )
+        # Txn 1: overwrite matched rows (never combined with append/add_files)
+        if rows_to_update is not None:
+            overwrite_filter = upsert_util.create_match_filter(rows_to_update, join_cols)
+            with table.transaction() as txn:
+                txn.overwrite(rows_to_update, overwrite_filter=overwrite_filter)
+            total_updated += len(rows_to_update)
 
-            del batch_tbl
-            if gc_collect_interval and batch_count % gc_collect_interval == 0:
-                gc.collect()
-            if batch_count % 10 == 0:
-                logger.debug(
-                    f"pyiceberg: upsert streamed {batch_count} batches,"
-                    f" {total_inserted} inserts, {total_updated} updates so far"
+        # Txn 2: insert new rows (separate transaction, safe for both partitioned and not)
+        if len(rows_to_insert) > 0:
+            total_inserted += len(rows_to_insert)
+            if is_partitioned:
+                with table.transaction() as txn:
+                    txn.append(rows_to_insert)
+            else:
+                remote_path = _upload_parquet_to_remote(
+                    rows_to_insert,
+                    f"{table.location()}/data",
+                    table.io,
+                    prefix="upsert",
+                    iceberg_table=table,
+                    upload_chunk_bytes=upload_chunk_bytes,
                 )
+                try:
+                    with table.transaction() as txn:
+                        txn.add_files([remote_path], check_duplicate_files=False)
+                except Exception:
+                    _delete_files(table.io, [remote_path])
+                    raise
 
-        if insert_paths:
-            txn.add_files(insert_paths, check_duplicate_files=False)
-
-    if partitioned_inserts:
-        with table.transaction() as insert_txn:
-            for insert_tbl in partitioned_inserts:
-                insert_txn.append(insert_tbl)
-        del partitioned_inserts
+        del batch_tbl
+        if batch_count % _GC_INTERVAL_BATCHES == 0:
+            gc.collect()
+        if batch_count % 10 == 0:
+            logger.debug(
+                f"pyiceberg: upsert streamed {batch_count} batches,"
+                f" {total_inserted} inserts, {total_updated} updates so far"
+            )
 
     logger.debug(
         f"pyiceberg: upsert {total_updated} updated, {total_inserted} inserted"
@@ -539,6 +580,15 @@ class IcebergConfig(BaseConfiguration):
         s3.secret-access-key = "cool-bucket-secret-key"
         s3.region = "cool-bucket-region"
     """
+
+    # Performance tuning — set via env vars:
+    #   ICEBERG_CATALOG__ICEBERG_PARQUET_BATCH_SIZE=100000
+    #   ICEBERG_CATALOG__ICEBERG_UPLOAD_CHUNK_BYTES=33554432
+    iceberg_parquet_batch_size: int = 50_000
+    """Rows per Arrow RecordBatch when reading staged parquet files into pyiceberg (default 50 000)."""
+
+    iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES
+    """Bytes per read when uploading a parquet file to remote storage (default 8 MB)."""
 
 
 def _load_catalog_from_pyiceberg(
@@ -653,6 +703,15 @@ def _load_catalog_from_config(
         config_dict.update(_get_fileio_config(credentials))
 
     return load_catalog(catalog_name, **config_dict)
+
+
+@with_config(spec=IcebergConfig, sections="iceberg_catalog")
+def get_iceberg_config_tuning(
+    iceberg_parquet_batch_size: int = 50_000,
+    iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
+) -> Tuple[int, int]:
+    """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars."""
+    return iceberg_parquet_batch_size, iceberg_upload_chunk_bytes
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")

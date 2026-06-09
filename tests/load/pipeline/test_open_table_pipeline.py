@@ -1455,3 +1455,109 @@ def test_iceberg_streamed_upsert(
     assert bob["name"] == "Bob"
     diana = next(r for r in rows if r["id"] == 4)
     assert diana["name"] == "Diana"
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_local_configs=True,
+        with_table_format="iceberg",
+        supports_merge=True,
+    ),
+    ids=lambda x: x.name,
+)
+def test_iceberg_streamed_upsert_duplicate_keys_across_batches(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Duplicate source keys split across internal batches should not create duplicates."""
+    from dlt.common.libs.pyiceberg import get_iceberg_tables
+
+    pipeline = destination_config.setup_pipeline(
+        f"iceberg_upsert_split_{uniq_id()}", dev_mode=True
+    )
+
+    @dlt.resource(
+        table_format="iceberg",
+        write_disposition="merge",
+        primary_key="id",
+    )
+    def items():
+        yield [{"id": i, "name": f"item-{i}", "score": i} for i in range(1, 1001)]
+        yield [{"id": 1, "name": "item-1-updated", "score": 9999}]
+
+    info = pipeline.run(items())
+    assert_load_info(info)
+    it = get_iceberg_tables(pipeline, "items")["items"]
+    data = it.scan().to_arrow()
+    assert data.num_rows == 1000
+
+    rows = data.to_pylist()
+    item_1 = next(r for r in rows if r["id"] == 1)
+    assert item_1["name"] == "item-1-updated"
+    assert item_1["score"] == 9999
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(
+        table_format_local_configs=True,
+        with_table_format="iceberg",
+        supports_merge=True,
+    ),
+    ids=lambda x: x.name,
+)
+def test_iceberg_partitioned_upsert_duplicate_keys_across_batches(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Duplicate source keys split across internal batches must not create duplicates
+    on a *partitioned* Iceberg table.
+
+    This is the regression test for the overwrite+append transaction-mixing bug:
+    PyIceberg crashes (SIGILL) when txn.overwrite() and txn.append() share one
+    transaction. The fix commits each operation in a separate transaction; this
+    test proves the split-batch case is correct end-to-end.
+    """
+    from dlt.common.libs.pyiceberg import get_iceberg_tables
+    from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+
+    pipeline = destination_config.setup_pipeline(
+        f"iceberg_partitioned_upsert_{uniq_id()}", dev_mode=True
+    )
+
+    @dlt.resource(
+        table_format="iceberg",
+        write_disposition="merge",
+        primary_key="id",
+    )
+    def items():
+        # First batch seeds 200 rows across two regions so every partition bucket
+        # gets data.  Second batch updates id=1 (same partition as seed) and
+        # inserts id=201 (new row).  If overwrite and append were mixed in one
+        # transaction the write would crash or leave stale rows.
+        yield [
+            {"id": i, "name": f"item-{i}", "region": "US" if i % 2 == 0 else "EU"}
+            for i in range(1, 201)
+        ]
+        yield [
+            {"id": 1, "name": "item-1-updated", "region": "EU"},   # update existing
+            {"id": 201, "name": "item-201-new", "region": "US"},   # insert new
+        ]
+
+    resource = iceberg_adapter(
+        items,
+        partition=["region"],
+    )
+
+    info = pipeline.run(resource)
+    assert_load_info(info)
+
+    it = get_iceberg_tables(pipeline, "items")["items"]
+    data = it.scan().to_arrow()
+    # 200 original + 1 new insert = 201 rows; id=1 updated in-place, no duplicate
+    assert data.num_rows == 201
+
+    rows = {r["id"]: r for r in data.to_pylist()}
+    assert rows[1]["name"] == "item-1-updated"
+    assert rows[201]["name"] == "item-201-new"
+    # Verify original rows are untouched
+    assert rows[2]["name"] == "item-2"

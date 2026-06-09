@@ -1,6 +1,6 @@
 import dataclasses
 
-from typing import Final, Optional, Type, Dict, Any
+from typing import Final, Optional, Type, Dict, Any, ClassVar, List
 
 from dlt.common import logger
 from dlt.common.configuration import configspec, resolve_type
@@ -25,19 +25,29 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
     """Maximum number of pipeline state files to keep; 0 or negative value disables cleanup."""
     always_refresh_views: bool = False
     """Always refresh table scanner views by setting the newest table metadata or globbing table files"""
-    iceberg_gc_collect_interval: int = 0
-    """How often (in batches) to run gc.collect() during streamed Iceberg writes. Set to 0 to disable."""
-    iceberg_upload_chunk_size: int = 8 * 1024 * 1024
-    """Bytes per chunk when uploading parquet files to object storage during Iceberg writes."""
-    recommended_file_size: int = 128 * 1024 * 1024
-    """Target max size (bytes) for loader parquet files written during normalize."""
-    iceberg_parquet_batch_size: int = 50_000
-    """Rows per Arrow batch when streaming parquet into Iceberg during pyiceberg load."""
-    iceberg_write_engine: str = "pyiceberg"
-    """Engine to use for all Iceberg writes (append, replace, merge/upsert):
-    'pyiceberg' (default, single-process) or 'spark' (distributed via PySpark)."""
-    spark_catalog_name: str = "rest"
-    """Spark Iceberg catalog name (used when iceberg_write_engine='spark')."""
+
+    iceberg_spark_config: Optional[Dict[str, str]] = None
+    """Spark/Iceberg configuration key-value pairs injected into SparkSession when
+    ``DLT_ICEBERG_WRITE_ENGINE=spark`` is set.  Use this to configure the REST catalog URI,
+    storage credentials, and any other ``spark.*`` properties.
+
+    Example::
+
+        destination.filesystem(
+            iceberg_spark_config={
+                "spark.sql.catalog.rest": "org.apache.iceberg.spark.SparkCatalog",
+                "spark.sql.catalog.rest.catalog-impl": "org.apache.iceberg.rest.RESTCatalog",
+                "spark.sql.catalog.rest.uri": "https://my-catalog.example.com",
+            }
+        )
+
+    .. note::
+        This field is a plain ``Dict`` and cannot be populated via nested ``__`` env vars
+        (e.g. ``DESTINATION__FILESYSTEM__ICEBERG_SPARK_CONFIG__KEY=value`` will not work).
+        Pass the dict directly in Python or via a dlt secrets/config file instead.
+    """
+
+    __config_gen_annotations__: ClassVar[List[str]] = ["iceberg_spark_config"]
 
     @resolve_type("credentials")
     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:

@@ -75,18 +75,6 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
 
         return caps
 
-    @classmethod
-    def adjust_capabilities(
-        cls,
-        caps: DestinationCapabilitiesContext,
-        config: FilesystemDestinationClientConfiguration,
-        naming: Optional[Any] = None,
-    ) -> DestinationCapabilitiesContext:
-        caps = super().adjust_capabilities(caps, config, naming)
-        if config is not None:
-            caps.recommended_file_size = config.recommended_file_size
-        return caps
-
     @property
     def client_class(self) -> Type["FilesystemClient"]:
         from dlt.destinations.impl.filesystem.filesystem import FilesystemClient

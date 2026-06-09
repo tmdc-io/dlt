@@ -230,7 +230,6 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
 
 class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
-        import gc
         import pyarrow.parquet as pq
         from dlt.common.libs.pyarrow import pyarrow as pa
         from dlt.common.libs.pyiceberg import (
@@ -285,94 +284,35 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
 
         del schema
 
-        gc_interval = self._job_client.config.iceberg_gc_collect_interval
-        upload_chunk_size = self._job_client.config.iceberg_upload_chunk_size
-        parquet_batch_size = self._job_client.config.iceberg_parquet_batch_size
-        if gc_interval:
-            gc.collect()
-
-        use_spark = self._job_client.config.iceberg_write_engine == "spark"
-
-        if use_spark:
-            gc.collect()
-            table_id = f"{self._job_client.dataset_name}.{self.load_table_name}"
-            catalog_name = self._job_client.config.spark_catalog_name
-            catalog_config = self._resolve_spark_catalog_config()
-
         write_disposition = self._load_table["write_disposition"]
 
+        from dlt.common.libs.pyiceberg import get_iceberg_config_tuning
+        parquet_batch_size, _ = get_iceberg_config_tuning()
+        arrow_rbr = pa.RecordBatchReader.from_batches(
+            pq.read_schema(self.file_paths[0]),
+            self._iter_parquet_batches(self.file_paths, batch_size=parquet_batch_size),
+        )
+
         if write_disposition == "merge" and table is not None:
-            if use_spark:
-                from dlt.common.libs.spark_iceberg import merge_iceberg_table_spark
-                from dlt.common.schema.utils import get_columns_names_with_prop
-
-                join_cols = get_columns_names_with_prop(self._load_table, "primary_key")
-                logger.info(
-                    f"[iceberg-dispatch] engine=spark op=merge"
-                    f" table={table_id} join_cols={join_cols}"
-                )
-                merge_iceberg_table_spark(
-                    file_paths=self.file_paths,
-                    table_id=table_id,
-                    join_cols=join_cols,
-                    catalog_name=catalog_name,
-                    catalog_config=catalog_config,
-                )
-            else:
-                logger.info(
-                    f"[iceberg-dispatch] engine=pyiceberg op=merge"
-                    f" table={self.load_table_name}"
-                )
-                source_ds = self.arrow_dataset
-                with source_ds.scanner(
-                    batch_readahead=0, fragment_readahead=0, use_threads=False
-                ).to_reader() as arrow_rbr:
-                    merge_iceberg_table(
-                        table=table,
-                        data=arrow_rbr,
-                        schema=self._load_table,
-                        load_table_name=self.load_table_name,
-                        gc_collect_interval=gc_interval,
-                        upload_chunk_size=upload_chunk_size,
-                    )
-                del source_ds
-        elif use_spark:
-            from dlt.common.libs.spark_iceberg import write_iceberg_table_spark
-
-            logger.info(
-                f"[iceberg-dispatch] engine=spark op=write"
-                f" table={table_id} disposition={write_disposition}"
+            logger.debug(
+                f"pyiceberg: merge table={self.load_table_name}"
             )
-            write_iceberg_table_spark(
-                file_paths=self.file_paths,
-                table_id=table_id,
-                write_disposition=write_disposition,
-                catalog_name=catalog_name,
-                catalog_config=catalog_config,
+            merge_iceberg_table(
+                table=table,
+                data=arrow_rbr,
+                schema=self._load_table,
+                load_table_name=self.load_table_name,
             )
         else:
-            logger.info(
-                f"[iceberg-dispatch] engine=pyiceberg op=write"
-                f" table={self.load_table_name} disposition={write_disposition}"
-            )
-            arrow_rbr = pa.RecordBatchReader.from_batches(
-                pq.read_schema(self.file_paths[0]),
-                self._iter_parquet_batches(
-                    self.file_paths,
-                    batch_size=parquet_batch_size,
-                    gc_collect_interval=gc_interval,
-                ),
+            logger.debug(
+                f"pyiceberg: {write_disposition} table={self.load_table_name}"
             )
             write_iceberg_table(
                 table=table,
                 data=arrow_rbr,
                 write_disposition=write_disposition,
-                gc_collect_interval=gc_interval,
-                upload_chunk_size=upload_chunk_size,
             )
 
-        if gc_interval:
-            gc.collect()
         logger.info(
             f"Copied {self.file_paths} to iceberg table {self.make_remote_url()}"
             f" [arrow buffer: {pa.total_allocated_bytes()}]"
@@ -382,7 +322,6 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def _iter_parquet_batches(
         file_paths: List[str],
         batch_size: int = 50_000,
-        gc_collect_interval: int = 10,
     ) -> Iterator[Any]:
         """Yield Arrow batches from parquet files one at a time for constant memory."""
         import gc
@@ -400,19 +339,8 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                 f"({file_size_mb:.1f} MB, {row_count:,} rows)"
             )
             del pf
-            if gc_collect_interval and idx % gc_collect_interval == 0:
+            if idx % 10 == 0:
                 gc.collect()
-
-    @staticmethod
-    def _resolve_spark_catalog_config() -> Optional[Dict[str, Any]]:
-        try:
-            from dlt.common.libs.pyiceberg import IcebergConfig
-            from dlt.common.configuration import resolve_configuration
-
-            ice_cfg = resolve_configuration(IcebergConfig(), sections=("iceberg_catalog",))
-            return ice_cfg.iceberg_catalog_config
-        except Exception:
-            return None
 
     def _get_partition_spec_list(self) -> List["PartitionSpec"]:
         """Resolve partition specs. Combines legacy partition columns (identity transform)
@@ -874,9 +802,23 @@ class FilesystemClient(
 
                     return DeltaLoadFilesystemJob(file_path)
                 elif table_format == "iceberg":
-                    import dlt.common.libs.pyiceberg
+                    # Use Spark engine when iceberg_spark_config is set on the destination
+                    # config, or when the DLT_ICEBERG_WRITE_ENGINE=spark env var is present.
+                    use_spark = bool(
+                        getattr(self.config, "iceberg_spark_config", None)
+                        or os.environ.get("DLT_ICEBERG_WRITE_ENGINE", "").lower() == "spark"
+                    )
+                    if use_spark:
+                        from dlt.destinations.impl.filesystem.iceberg_spark_job import (
+                            IcebergSparkLoadFilesystemJob,
+                        )
 
-                    return IcebergLoadFilesystemJob(file_path)
+                        return IcebergSparkLoadFilesystemJob(file_path)
+                    else:
+                        # Default: PyIceberg
+                        import dlt.common.libs.pyiceberg
+
+                        return IcebergLoadFilesystemJob(file_path)
 
             # otherwise just continue
             return FinalizedLoadJobWithFollowupJobs(file_path)
