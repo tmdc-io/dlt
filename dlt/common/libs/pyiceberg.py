@@ -706,11 +706,10 @@ def _load_catalog_from_config(
 
 @with_config(spec=BufferedDataWriter.BufferedDataWriterConfiguration)
 def _get_writer_config(
-    buffer_max_items: int,
-    file_max_items: Optional[int],
-) -> Tuple[int, Optional[int]]:
-    """Resolve data_writer config — defaults owned by BufferedDataWriterConfiguration."""
-    return buffer_max_items, file_max_items
+    file_max_items: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve file_max_items from data_writer config (set via LOADER_FILE_SIZE)."""
+    return file_max_items
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
@@ -719,12 +718,10 @@ def get_iceberg_config_tuning(
 ) -> Tuple[int, int]:
     """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars.
 
-    Arrow batch size mirrors BufferedDataWriter: min(buffer_max_items, file_max_items).
-    Defaults are owned by dlt (BufferedDataWriterConfiguration), not hardcoded here.
+    Arrow batch size equals file_max_items (LOADER_FILE_SIZE) so that each
+    intermediate file is read as one batch: 1 file = 1 batch.
     """
-    buffer_max_items, file_max_items = _get_writer_config()
-    # Mirror BufferedDataWriter logic: batch cannot exceed the file item limit
-    parquet_batch_size = min(buffer_max_items, file_max_items or buffer_max_items)
+    parquet_batch_size = _get_writer_config() or 50_000
     return parquet_batch_size, iceberg_upload_chunk_bytes
 
 
