@@ -19,6 +19,7 @@ from dlt.common.utils import assert_min_pkg_version
 from dlt.common.exceptions import MissingDependencyException
 from dlt.common.storages.configuration import FileSystemCredentials, FilesystemConfiguration
 from dlt.common.configuration.specs import CredentialsConfiguration
+from dlt.common.data_writers.buffered import BufferedDataWriter
 from dlt.common.configuration.specs.mixins import WithPyicebergConfig
 from dlt.common.configuration.inject import with_config
 from dlt.common.configuration import configspec
@@ -581,11 +582,9 @@ class IcebergConfig(BaseConfiguration):
         s3.region = "cool-bucket-region"
     """
 
-    # Performance tuning — set via env vars:
-    #   ICEBERG_CATALOG__ICEBERG_PARQUET_BATCH_SIZE=100000
+    # Performance tuning — set via env var:
     #   ICEBERG_CATALOG__ICEBERG_UPLOAD_CHUNK_BYTES=33554432
-    iceberg_parquet_batch_size: int = 50_000
-    """Rows per Arrow RecordBatch when reading staged parquet files into pyiceberg (default 50 000)."""
+    # Arrow batch size is controlled via DATA_WRITER__BUFFER_MAX_ITEMS (default 5 000).
 
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES
     """Bytes per read when uploading a parquet file to remote storage (default 8 MB)."""
@@ -705,13 +704,28 @@ def _load_catalog_from_config(
     return load_catalog(catalog_name, **config_dict)
 
 
+@with_config(spec=BufferedDataWriter.BufferedDataWriterConfiguration)
+def _get_writer_config(
+    buffer_max_items: int,
+    file_max_items: Optional[int],
+) -> Tuple[int, Optional[int]]:
+    """Resolve data_writer config — defaults owned by BufferedDataWriterConfiguration."""
+    return buffer_max_items, file_max_items
+
+
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
 def get_iceberg_config_tuning(
-    iceberg_parquet_batch_size: int = 50_000,
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
 ) -> Tuple[int, int]:
-    """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars."""
-    return iceberg_parquet_batch_size, iceberg_upload_chunk_bytes
+    """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars.
+
+    Arrow batch size mirrors BufferedDataWriter: min(buffer_max_items, file_max_items).
+    Defaults are owned by dlt (BufferedDataWriterConfiguration), not hardcoded here.
+    """
+    buffer_max_items, file_max_items = _get_writer_config()
+    # Mirror BufferedDataWriter logic: batch cannot exceed the file item limit
+    parquet_batch_size = min(buffer_max_items, file_max_items or buffer_max_items)
+    return parquet_batch_size, iceberg_upload_chunk_bytes
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
