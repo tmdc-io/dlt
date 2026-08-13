@@ -236,6 +236,8 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             write_iceberg_table,
             merge_iceberg_table,
             create_table,
+            get_iceberg_config_tuning,
+            reconcile_iceberg_metadata_compression,
         )
         from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
             build_iceberg_partition_spec,
@@ -247,6 +249,8 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             f"Will copy file(s) {self.file_paths} to iceberg table"
             f" {self.make_remote_url()} [arrow buffer: {pa.total_allocated_bytes()}]"
         )
+
+        parquet_batch_size, _, table_properties = get_iceberg_config_tuning()
 
         try:
             table = self._job_client.load_open_table(
@@ -270,6 +274,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                     table_location=location,
                     schema=iceberg_schema,
                     partition_spec=partition_spec,
+                    properties=table_properties,
                 )
             else:
                 create_table(
@@ -277,17 +282,16 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
                     table_id,
                     table_location=location,
                     schema=schema,
+                    properties=table_properties,
                 )
 
             self.run()
             return
 
+        reconcile_iceberg_metadata_compression(table, table_properties)
         del schema
 
         write_disposition = self._load_table["write_disposition"]
-
-        from dlt.common.libs.pyiceberg import get_iceberg_config_tuning
-        parquet_batch_size, _ = get_iceberg_config_tuning()
         arrow_rbr = pa.RecordBatchReader.from_batches(
             pq.read_schema(self.file_paths[0]),
             self._iter_parquet_batches(self.file_paths, batch_size=parquet_batch_size),

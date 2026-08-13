@@ -37,6 +37,7 @@ try:
         UNPARTITIONED_PARTITION_SPEC,
         PartitionSpec as IcebergPartitionSpec,
     )
+    from pyiceberg.table.locations import SimpleLocationProvider
     import pyarrow as pa
     from pydantic import BaseModel, ConfigDict, Field
 except ModuleNotFoundError:
@@ -47,6 +48,22 @@ except ModuleNotFoundError:
     )
 
 pyiceberg_semver = Version(pyiceberg.__version__)
+
+_GZIP_LOCATION_PROVIDER_IMPL = "dlt.common.libs.pyiceberg.GzipMetadataLocationProvider"
+_LOCATION_PROVIDER_PROPERTY = "write.py-location-provider.impl"
+
+
+class GzipMetadataLocationProvider(SimpleLocationProvider):
+    """Location provider that emits .gz.metadata.json filenames so pyiceberg's
+    Compressor automatically applies gzip compression when writing metadata files."""
+
+    def new_table_metadata_file_location(self, new_version: int = 0) -> str:
+        import uuid
+
+        if new_version < 0:
+            raise ValueError(f"Table metadata version: `{new_version}` must be a non-negative integer")
+        file_name = f"{new_version:05d}-{uuid.uuid4()}.gz.metadata.json"
+        return self.new_metadata_location(file_name)
 
 if pyiceberg_semver < Version("0.10.0"):
     import pyiceberg.io.pyarrow as _pio
@@ -186,7 +203,7 @@ def write_iceberg_table(
     )
 
     if isinstance(data, pa.RecordBatchReader):
-        _, upload_chunk_bytes = get_iceberg_config_tuning()
+        _, upload_chunk_bytes, __ = get_iceberg_config_tuning()
         _write_iceberg_table_streamed(table, data, write_disposition, upload_chunk_bytes)
     else:
         if write_disposition == "append":
@@ -356,7 +373,7 @@ def merge_iceberg_table(
         else:
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
-        _, upload_chunk_bytes = get_iceberg_config_tuning()
+        _, upload_chunk_bytes, __ = get_iceberg_config_tuning()
         _upsert_iceberg_table(
             table,
             data,
@@ -589,6 +606,19 @@ class IcebergConfig(BaseConfiguration):
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES
     """Bytes per read when uploading a parquet file to remote storage (default 8 MB)."""
 
+    iceberg_metadata_compression: str = "gzip"
+    """Compression codec for Iceberg metadata JSON files. Set to 'gzip' to write
+    .gz.metadata.json files (smaller metadata, compatible with Java Iceberg readers),
+    or 'none' to disable compression. Defaults to 'gzip'.
+
+    Set via env var:
+        ICEBERG_CATALOG__ICEBERG_METADATA_COMPRESSION=gzip
+
+    Or in secrets.toml:
+        [iceberg_catalog]
+        iceberg_metadata_compression = "gzip"
+    """
+
 
 def _load_catalog_from_pyiceberg(
     catalog_name: str,
@@ -715,14 +745,48 @@ def _get_writer_config(
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
 def get_iceberg_config_tuning(
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
-) -> Tuple[int, int]:
-    """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars.
+    iceberg_metadata_compression: str = "gzip",
+) -> Tuple[int, int, Optional[Dict[str, str]]]:
+    """Return (parquet_batch_size, upload_chunk_bytes, iceberg_table_properties) resolved from dlt config / env vars.
 
     Arrow batch size equals file_max_items (LOADER_FILE_SIZE) so that each
     intermediate file is read as one batch: 1 file = 1 batch.
+
+    iceberg_table_properties contains the gzip location provider, or is empty when compression
+    is explicitly disabled.
     """
     parquet_batch_size = _get_writer_config() or 50_000
-    return parquet_batch_size, iceberg_upload_chunk_bytes
+    compression = iceberg_metadata_compression.strip().lower()
+    table_properties: Dict[str, str]
+    if compression == "gzip":
+        table_properties = {_LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL}
+    elif compression == "none":
+        table_properties = {}
+    else:
+        raise ValueError(
+            "Unsupported Iceberg metadata compression codec "
+            f"'{iceberg_metadata_compression}'. Expected 'gzip' or 'none'."
+        )
+    return parquet_batch_size, iceberg_upload_chunk_bytes, table_properties
+
+
+def reconcile_iceberg_metadata_compression(
+    table: IcebergTable, table_properties: Optional[Dict[str, str]]
+) -> None:
+    """Apply an explicitly configured metadata compression setting to an existing table."""
+    if table_properties is None:
+        return
+
+    configured_provider = table_properties.get(_LOCATION_PROVIDER_PROPERTY)
+    current_provider = table.properties.get(_LOCATION_PROVIDER_PROPERTY)
+    if configured_provider == current_provider:
+        return
+
+    with table.transaction() as transaction:
+        if configured_provider:
+            transaction.set_properties({_LOCATION_PROVIDER_PROPERTY: configured_provider})
+        elif current_provider:
+            transaction.remove_properties(_LOCATION_PROVIDER_PROPERTY)
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
