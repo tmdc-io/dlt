@@ -11,9 +11,7 @@ from dlt.common.typing import ConfigValue
 sqlalchemy = pytest.importorskip("sqlalchemy", minversion="2.0")
 
 from dlt.common.libs.pyiceberg import (
-    _GZIP_LOCATION_PROVIDER_IMPL,
-    _LOCATION_PROVIDER_PROPERTY,
-    GzipMetadataLocationProvider,
+    _METADATA_COMPRESSION_PROPERTY,
     get_catalog,
     get_iceberg_config_tuning,
     reconcile_iceberg_metadata_compression,
@@ -118,21 +116,12 @@ def catalog_config(request):
 
 
 def test_iceberg_metadata_compression_config() -> None:
-    gzip_properties = {
-        _LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL
-    }
-    assert get_iceberg_config_tuning()[2] == gzip_properties
-    assert get_iceberg_config_tuning(iceberg_metadata_compression="gzip")[2] == gzip_properties
+    assert get_iceberg_config_tuning()[2] == {_METADATA_COMPRESSION_PROPERTY: "gzip"}
+    assert get_iceberg_config_tuning(iceberg_metadata_compression="gzip")[2] == {_METADATA_COMPRESSION_PROPERTY: "gzip"}
     assert get_iceberg_config_tuning(iceberg_metadata_compression="none")[2] == {}
 
     with pytest.raises(ValueError, match="Expected 'gzip' or 'none'"):
         get_iceberg_config_tuning(iceberg_metadata_compression="gizp")
-
-
-def test_gzip_metadata_location_provider() -> None:
-    provider = GzipMetadataLocationProvider("s3://bucket/table", {})
-
-    assert provider.new_table_metadata_file_location().endswith(".gz.metadata.json")
 
 
 def test_reconcile_iceberg_metadata_compression() -> None:
@@ -140,18 +129,14 @@ def test_reconcile_iceberg_metadata_compression() -> None:
     transaction = table.transaction.return_value.__enter__.return_value
 
     table.properties = {}
-    reconcile_iceberg_metadata_compression(
-        table, {_LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL}
-    )
-    transaction.set_properties.assert_called_once_with(
-        {_LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL}
-    )
+    reconcile_iceberg_metadata_compression(table, {_METADATA_COMPRESSION_PROPERTY: "gzip"})
+    transaction.set_properties.assert_called_once_with({_METADATA_COMPRESSION_PROPERTY: "gzip"})
 
     table.reset_mock()
     transaction = table.transaction.return_value.__enter__.return_value
-    table.properties = {_LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL}
+    table.properties = {_METADATA_COMPRESSION_PROPERTY: "gzip"}
     reconcile_iceberg_metadata_compression(table, {})
-    transaction.remove_properties.assert_called_once_with(_LOCATION_PROVIDER_PROPERTY)
+    transaction.remove_properties.assert_called_once_with(_METADATA_COMPRESSION_PROPERTY)
 
     table.reset_mock()
     reconcile_iceberg_metadata_compression(table, None)

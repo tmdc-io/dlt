@@ -37,7 +37,6 @@ try:
         UNPARTITIONED_PARTITION_SPEC,
         PartitionSpec as IcebergPartitionSpec,
     )
-    from pyiceberg.table.locations import SimpleLocationProvider
     import pyarrow as pa
     from pydantic import BaseModel, ConfigDict, Field
 except ModuleNotFoundError:
@@ -49,21 +48,7 @@ except ModuleNotFoundError:
 
 pyiceberg_semver = Version(pyiceberg.__version__)
 
-_GZIP_LOCATION_PROVIDER_IMPL = "dlt.common.libs.pyiceberg.GzipMetadataLocationProvider"
-_LOCATION_PROVIDER_PROPERTY = "write.py-location-provider.impl"
-
-
-class GzipMetadataLocationProvider(SimpleLocationProvider):
-    """Location provider that emits .gz.metadata.json filenames so pyiceberg's
-    Compressor automatically applies gzip compression when writing metadata files."""
-
-    def new_table_metadata_file_location(self, new_version: int = 0) -> str:
-        import uuid
-
-        if new_version < 0:
-            raise ValueError(f"Table metadata version: `{new_version}` must be a non-negative integer")
-        file_name = f"{new_version:05d}-{uuid.uuid4()}.gz.metadata.json"
-        return self.new_metadata_location(file_name)
+_METADATA_COMPRESSION_PROPERTY = "write.metadata.compression-codec"
 
 if pyiceberg_semver < Version("0.10.0"):
     import pyiceberg.io.pyarrow as _pio
@@ -751,15 +736,12 @@ def get_iceberg_config_tuning(
 
     Arrow batch size equals file_max_items (LOADER_FILE_SIZE) so that each
     intermediate file is read as one batch: 1 file = 1 batch.
-
-    iceberg_table_properties contains the gzip location provider, or is empty when compression
-    is explicitly disabled.
     """
     parquet_batch_size = _get_writer_config() or 50_000
     compression = iceberg_metadata_compression.strip().lower()
     table_properties: Dict[str, str]
     if compression == "gzip":
-        table_properties = {_LOCATION_PROVIDER_PROPERTY: _GZIP_LOCATION_PROVIDER_IMPL}
+        table_properties = {_METADATA_COMPRESSION_PROPERTY: "gzip"}
     elif compression == "none":
         table_properties = {}
     else:
@@ -777,16 +759,16 @@ def reconcile_iceberg_metadata_compression(
     if table_properties is None:
         return
 
-    configured_provider = table_properties.get(_LOCATION_PROVIDER_PROPERTY)
-    current_provider = table.properties.get(_LOCATION_PROVIDER_PROPERTY)
-    if configured_provider == current_provider:
+    configured = table_properties.get(_METADATA_COMPRESSION_PROPERTY)
+    current = table.properties.get(_METADATA_COMPRESSION_PROPERTY)
+    if configured == current:
         return
 
     with table.transaction() as transaction:
-        if configured_provider:
-            transaction.set_properties({_LOCATION_PROVIDER_PROPERTY: configured_provider})
-        elif current_provider:
-            transaction.remove_properties(_LOCATION_PROVIDER_PROPERTY)
+        if configured:
+            transaction.set_properties({_METADATA_COMPRESSION_PROPERTY: configured})
+        elif current:
+            transaction.remove_properties(_METADATA_COMPRESSION_PROPERTY)
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
