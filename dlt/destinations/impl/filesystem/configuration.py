@@ -26,6 +26,10 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
     always_refresh_views: bool = False
     """Always refresh table scanner views by setting the newest table metadata or globbing table files"""
 
+    state_bucket_url: Optional[str] = None
+    """If set, dlt internal tables (_dlt_*) are written here instead of bucket_url.
+    e.g. Microsoft Fabric OneLake /Tables vs /Files."""
+
     iceberg_spark_config: Optional[Dict[str, str]] = None
     """Spark/Iceberg configuration key-value pairs injected into SparkSession when
     ``DLT_ICEBERG_WRITE_ENGINE=spark`` is set.  Use this to configure the REST catalog URI,

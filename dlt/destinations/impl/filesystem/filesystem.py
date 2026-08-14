@@ -899,8 +899,7 @@ class FilesystemClient(
             "schema_version_hash": self.schema.version_hash,
         }
         filepath = self.pathlib.join(
-            self.dataset_path,
-            self.schema.loads_table_name,
+            self.get_table_dir(self.schema.loads_table_name),
             f"{self.schema.name}{FILENAME_SEPARATOR}{load_id}.jsonl",
         )
         self._write_to_json_file(filepath, load_data)
