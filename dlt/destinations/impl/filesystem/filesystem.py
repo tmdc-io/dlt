@@ -243,7 +243,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             build_iceberg_partition_spec,
         )
 
-        schema = pq.read_schema(self.file_paths[0])
+        schema = pa.unify_schemas([pq.read_schema(f) for f in self.file_paths])
 
         logger.info(
             f"Will copy file(s) {self.file_paths} to iceberg table"
@@ -289,11 +289,10 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             return
 
         reconcile_iceberg_metadata_compression(table, table_properties)
-        del schema
 
         write_disposition = self._load_table["write_disposition"]
         arrow_rbr = pa.RecordBatchReader.from_batches(
-            pq.read_schema(self.file_paths[0]),
+            schema,
             self._iter_parquet_batches(self.file_paths, batch_size=parquet_batch_size),
         )
 
