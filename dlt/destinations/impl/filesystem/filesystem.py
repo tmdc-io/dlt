@@ -694,7 +694,6 @@ class FilesystemClient(
                 dirs_to_create = self.get_table_dirs(table_names)
                 for _, directory in zip(table_names, dirs_to_create):
                     self.fs_client.makedirs(directory, exist_ok=True)
-                self._update_schema_in_storage(self.schema)
 
         # we assume that expected_update == applied_update so table schemas in dest were not
         # externally changed
@@ -907,6 +906,12 @@ class FilesystemClient(
         # store current state
         self._store_current_state(load_id)
         self._store_load(load_id)
+        # Schema write is deferred from update_stored_schema so that a failed load
+        # never leaves a stale schema entry in storage.
+        if not self.config.as_staging_destination:
+            current_hash = self.schema.stored_version_hash
+            if not self._get_stored_schema_by_hash_or_newest(current_hash):
+                self._update_schema_in_storage(self.schema)
 
     #
     # state read/write
