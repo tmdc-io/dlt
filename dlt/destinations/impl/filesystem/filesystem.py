@@ -175,23 +175,49 @@ class TableFormatLoadFilesystemJob(FilesystemLoadJob):
     def _partition_columns(self) -> List[str]:
         return get_columns_names_with_prop(self._load_table, "partition")
 
+    @staticmethod
+    def _iter_parquet_batches(
+        file_paths: List[str],
+        batch_size: int = 50_000,
+    ) -> Iterator[Any]:
+        """Yield Arrow batches from parquet files one at a time for constant memory."""
+        import gc
+        import pyarrow.parquet as pq
+
+        for idx, file_path in enumerate(file_paths, 1):
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            pf = pq.ParquetFile(file_path)
+            row_count = 0
+            for batch in pf.iter_batches(batch_size=batch_size):
+                row_count += batch.num_rows
+                yield batch
+            logger.info(
+                f"[load] File {idx}/{len(file_paths)}: {file_path} "
+                f"({file_size_mb:.1f} MB, {row_count:,} rows)"
+            )
+            del pf
+            if idx % 10 == 0:
+                gc.collect()
+
 
 class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
     def run(self) -> None:
-        # create Arrow dataset from Parquet files
+        import pyarrow.parquet as pq
         from dlt.common.libs.pyarrow import pyarrow as pa
         from dlt.common.libs.deltalake import (
             write_delta_table,
             merge_delta_table,
             DeltaTable,
             deltalake_storage_options,
+            get_delta_config_tuning,
         )
 
         logger.info(
             f"Will copy file(s) {self.file_paths} to delta table {self.make_remote_url()} [arrow"
             f" buffer: {pa.total_allocated_bytes()}]"
         )
-        source_ds = self.arrow_dataset
+        schema = pa.unify_schemas([pq.read_schema(f) for f in self.file_paths])
+
         storage_options = deltalake_storage_options(self._job_client.config)
         try:
             delta_table: DeltaTable = self._job_client.load_open_table(
@@ -200,27 +226,36 @@ class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
         except DestinationUndefinedEntity:
             delta_table = None
 
-        with source_ds.scanner().to_reader() as arrow_rbr:  # RecordBatchReader
-            if self._load_table["write_disposition"] == "merge" and delta_table is not None:
-                merge_delta_table(
-                    table=delta_table,
-                    data=arrow_rbr,
-                    schema=self._load_table,
-                    load_table_name=self.load_table_name,
-                    streamed_exec=self._job_client.config.deltalake_streamed_exec,
-                )
-            else:
-                location = self._job_client.get_open_table_location("delta", self.load_table_name)
-                write_delta_table(
-                    table_or_uri=location if delta_table is None else delta_table,
-                    data=arrow_rbr,
-                    write_disposition=self._load_table["write_disposition"],
-                    partition_by=self._partition_columns,
-                    storage_options=storage_options,
-                    configuration=self._job_client.config.deltalake_configuration,
-                )
-        # release memory ASAP by deleting objects explicitly
-        del source_ds
+        target_file_size = self._job_client.config.deltalake_target_file_size_bytes or None
+
+        # Stream staged files one at a time to bound peak memory to ~one batch.
+        # Replaces pyarrow.dataset scanner that caused 30 GB+ spikes on large tables.
+        delta_parquet_batch_size = get_delta_config_tuning()
+        arrow_rbr = pa.RecordBatchReader.from_batches(
+            schema,
+            self._iter_parquet_batches(self.file_paths, batch_size=delta_parquet_batch_size),
+        )
+
+        if self._load_table["write_disposition"] == "merge" and delta_table is not None:
+            merge_delta_table(
+                table=delta_table,
+                data=arrow_rbr,
+                schema=self._load_table,
+                load_table_name=self.load_table_name,
+                streamed_exec=self._job_client.config.deltalake_streamed_exec,
+            )
+        else:
+            location = self._job_client.get_open_table_location("delta", self.load_table_name)
+            write_delta_table(
+                table_or_uri=location if delta_table is None else delta_table,
+                data=arrow_rbr,
+                write_disposition=self._load_table["write_disposition"],
+                partition_by=self._partition_columns,
+                storage_options=storage_options,
+                configuration=self._job_client.config.deltalake_configuration,
+                target_file_size=target_file_size,
+            )
+
         del delta_table
         logger.info(
             f"Copied {self.file_paths} to delta table {self.make_remote_url()} [arrow buffer:"
@@ -320,30 +355,6 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             f"Copied {self.file_paths} to iceberg table {self.make_remote_url()}"
             f" [arrow buffer: {pa.total_allocated_bytes()}]"
         )
-
-    @staticmethod
-    def _iter_parquet_batches(
-        file_paths: List[str],
-        batch_size: int = 50_000,
-    ) -> Iterator[Any]:
-        """Yield Arrow batches from parquet files one at a time for constant memory."""
-        import gc
-        import pyarrow.parquet as pq
-
-        for idx, file_path in enumerate(file_paths, 1):
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            pf = pq.ParquetFile(file_path)
-            row_count = 0
-            for batch in pf.iter_batches(batch_size=batch_size):
-                row_count += batch.num_rows
-                yield batch
-            logger.info(
-                f"[load] File {idx}/{len(file_paths)}: {file_path} "
-                f"({file_size_mb:.1f} MB, {row_count:,} rows)"
-            )
-            del pf
-            if idx % 10 == 0:
-                gc.collect()
 
     def _get_partition_spec_list(self) -> List["PartitionSpec"]:
         """Resolve partition specs. Combines legacy partition columns (identity transform)

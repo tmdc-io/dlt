@@ -213,6 +213,8 @@ class FilesystemConfiguration(BaseConfiguration):
     deltalake_storage_options: Optional[DictStrAny] = None
     deltalake_configuration: Optional[DictStrOptionalStr] = None
     deltalake_streamed_exec: bool = True
+    deltalake_target_file_size_bytes: Optional[int] = None
+    """Target output file size in bytes for Delta writes; defaults to delta.targetFileSize or delta-rs default (~128 MB)."""
 
     @property
     def protocol(self) -> str:

@@ -14,6 +14,8 @@ from dlt.common.exceptions import MissingDependencyException, ValueErrorWithKnow
 from dlt.common.storages import FilesystemConfiguration
 from dlt.common.utils import assert_min_pkg_version
 from dlt.common.configuration.specs.mixins import WithObjectStoreRsCredentials
+from dlt.common.configuration.inject import with_config
+from dlt.common.data_writers.buffered import BufferedDataWriter
 
 try:
     import deltalake
@@ -90,6 +92,24 @@ def get_delta_write_mode(write_disposition: TWriteDisposition) -> str:
         )
 
 
+@with_config(spec=BufferedDataWriter.BufferedDataWriterConfiguration)
+def _get_delta_writer_config(
+    file_max_items: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve file_max_items from data_writer config (set via LOADER_FILE_SIZE)."""
+    return file_max_items
+
+
+def get_delta_config_tuning() -> int:
+    """Return parquet batch size for Delta streaming reads.
+
+    Defaults to 65,536 (PyArrow scan default). Set LOADER_FILE_SIZE to tune:
+    larger values reduce per-batch iteration overhead at the cost of higher
+    memory per batch.
+    """
+    return _get_delta_writer_config() or 65_536
+
+
 def write_delta_table(
     table_or_uri: Union[str, Path, DeltaTable],
     data: Union[pa.Table, pa.RecordBatchReader],
@@ -97,6 +117,7 @@ def write_delta_table(
     partition_by: Optional[Union[List[str], str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     configuration: Optional[Mapping[str, Optional[str]]] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """Writes in-memory Arrow data to on-disk Delta table.
 
@@ -110,6 +131,7 @@ def write_delta_table(
         schema_mode="merge",  # enable schema evolution (adding new columns)
         storage_options=storage_options,
         configuration=configuration,
+        target_file_size=target_file_size,
     )
 
 
