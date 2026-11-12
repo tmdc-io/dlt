@@ -30,7 +30,7 @@ from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 
 try:
     import pyiceberg
-    from pyiceberg.table import Table as IcebergTable
+    from pyiceberg.table import Table as IcebergTable, TableProperties
     from pyiceberg.catalog import Catalog as IcebergCatalog
     from pyiceberg.exceptions import NoSuchTableError
     from pyiceberg.partitioning import (
@@ -47,8 +47,6 @@ except ModuleNotFoundError:
     )
 
 pyiceberg_semver = Version(pyiceberg.__version__)
-
-_METADATA_COMPRESSION_PROPERTY = "write.metadata.compression-codec"
 
 if pyiceberg_semver < Version("0.10.0"):
     import pyiceberg.io.pyarrow as _pio
@@ -124,8 +122,13 @@ def _upload_parquet_to_remote(
     prefix: str = "batch",
     iceberg_table: Optional[IcebergTable] = None,
     upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
-) -> str:
-    """Write an Arrow table to a temp Parquet file and upload it to remote storage.
+) -> List[str]:
+    """Write an Arrow table to one or more Parquet files and upload to remote storage.
+
+    If write.target-file-size-bytes is set on the table, data is split into multiple
+    files using PyIceberg's bin-packing algorithm. The split is based on Arrow in-memory
+    byte size (uncompressed), so actual Parquet files will typically be smaller due to
+    compression.
 
     If iceberg_table is provided, Iceberg field IDs are injected into the
     Parquet schema metadata so add_files can match columns without a name mapping.
@@ -134,7 +137,20 @@ def _upload_parquet_to_remote(
     import tempfile
 
     import pyarrow.parquet as pq
+    from pyiceberg.io.pyarrow import bin_pack_arrow_table, _get_parquet_writer_kwargs
+    from pyiceberg.utils.properties import property_as_int
 
+    props = iceberg_table.properties if iceberg_table is not None else {}
+    parquet_writer_kwargs = _get_parquet_writer_kwargs(props)
+
+    # Resolve target file size for bin packing — mirrors PyIceberg's own _to_data_files logic.
+    target_file_size: int = property_as_int(  # type: ignore[assignment]  # default is always non-None
+        properties=props,
+        property_name=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+        default=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+    )
+
+    # Inject Iceberg field IDs once on the full table schema before splitting.
     write_table = arrow_table
     if iceberg_table is not None:
         schema_with_ids = _inject_iceberg_field_ids(arrow_table.schema, iceberg_table)
@@ -144,25 +160,29 @@ def _upload_parquet_to_remote(
                 schema=schema_with_ids,
             )
 
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-        temp_path = tmp.name
-    try:
-        pq.write_table(
-            write_table, temp_path, compression="snappy", store_decimal_as_integer=True
-        )
+    remote_paths: List[str] = []
+    for record_batches in bin_pack_arrow_table(write_table, target_file_size):
+        chunk = pa.Table.from_batches(record_batches, schema=write_table.schema)
+        if chunk.num_rows == 0:
+            continue
 
-        remote_path = f"{data_location}/{prefix}-{uuid.uuid4()}.parquet"
-        output = table_io.new_output(remote_path)
-        with open(temp_path, "rb") as fh, output.create() as remote_file:
-            while True:
-                chunk = fh.read(upload_chunk_bytes)
-                if not chunk:
-                    break
-                remote_file.write(chunk)
-    finally:
-        os.remove(temp_path)
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            temp_path = tmp.name
+        try:
+            pq.write_table(chunk, temp_path, **parquet_writer_kwargs, store_decimal_as_integer=True)
+            remote_path = f"{data_location}/{prefix}-{uuid.uuid4()}.parquet"
+            output = table_io.new_output(remote_path)
+            with open(temp_path, "rb") as fh, output.create() as remote_file:
+                while True:
+                    data = fh.read(upload_chunk_bytes)
+                    if not data:
+                        break
+                    remote_file.write(data)
+            remote_paths.append(remote_path)
+        finally:
+            os.remove(temp_path)
 
-    return remote_path
+    return remote_paths
 
 
 def _delete_files(table_io: Any, paths: List[str]) -> None:
@@ -299,7 +319,7 @@ def _write_streamed_unpartitioned_atomic(
         for batch in reader:
             batch_count += 1
             batch_table = ensure_iceberg_compatible_arrow_data(pa.Table.from_batches([batch]))
-            file_path = _upload_parquet_to_remote(
+            file_paths = _upload_parquet_to_remote(
                 batch_table,
                 data_location,
                 table.io,
@@ -307,7 +327,7 @@ def _write_streamed_unpartitioned_atomic(
                 iceberg_table=table,
                 upload_chunk_bytes=upload_chunk_bytes,
             )
-            accumulated_files.append(file_path)
+            accumulated_files.extend(file_paths)
             total_rows += batch_table.num_rows
             del batch_table
 
@@ -472,7 +492,7 @@ def _upsert_iceberg_table(
                 with table.transaction() as txn:
                     txn.append(rows_to_insert)
             else:
-                remote_path = _upload_parquet_to_remote(
+                remote_paths = _upload_parquet_to_remote(
                     rows_to_insert,
                     f"{table.location()}/data",
                     table.io,
@@ -480,12 +500,13 @@ def _upsert_iceberg_table(
                     iceberg_table=table,
                     upload_chunk_bytes=upload_chunk_bytes,
                 )
-                try:
-                    with table.transaction() as txn:
-                        txn.add_files([remote_path], check_duplicate_files=False)
-                except Exception:
-                    _delete_files(table.io, [remote_path])
-                    raise
+                if remote_paths:
+                    try:
+                        with table.transaction() as txn:
+                            txn.add_files(remote_paths, check_duplicate_files=False)
+                    except Exception:
+                        _delete_files(table.io, remote_paths)
+                        raise
 
         del batch_tbl
         if batch_count % _GC_INTERVAL_BATCHES == 0:
@@ -591,17 +612,16 @@ class IcebergConfig(BaseConfiguration):
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES
     """Bytes per read when uploading a parquet file to remote storage (default 8 MB)."""
 
-    iceberg_metadata_compression: str = "gzip"
-    """Compression codec for Iceberg metadata JSON files. Set to 'gzip' to write
-    .gz.metadata.json files (smaller metadata, compatible with Java Iceberg readers),
-    or 'none' to disable compression. Defaults to 'gzip'.
+    iceberg_table_properties: Optional[Dict[str, str]] = None
+    """Iceberg table properties applied to new and existing tables. Values must be strings.
 
-    Set via env var:
-        ICEBERG_CATALOG__ICEBERG_METADATA_COMPRESSION=gzip
+    Set via env var (JSON string):
+        ICEBERG_CATALOG__ICEBERG_TABLE_PROPERTIES='{"write.metadata.compression-codec": "gzip"}'
 
     Or in secrets.toml:
         [iceberg_catalog]
-        iceberg_metadata_compression = "gzip"
+        [iceberg_catalog.iceberg_table_properties]
+        "write.metadata.compression-codec" = "gzip"
     """
 
 
@@ -730,45 +750,31 @@ def _get_writer_config(
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
 def get_iceberg_config_tuning(
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
-    iceberg_metadata_compression: str = "gzip",
-) -> Tuple[int, int, Optional[Dict[str, str]]]:
+    iceberg_table_properties: Optional[Dict[str, str]] = None,
+) -> Tuple[int, int, Dict[str, str]]:
     """Return (parquet_batch_size, upload_chunk_bytes, iceberg_table_properties) resolved from dlt config / env vars.
 
     Arrow batch size equals file_max_items (LOADER_FILE_SIZE) so that each
     intermediate file is read as one batch: 1 file = 1 batch.
     """
     parquet_batch_size = _get_writer_config() or 50_000
-    compression = iceberg_metadata_compression.strip().lower()
-    table_properties: Dict[str, str]
-    if compression == "gzip":
-        table_properties = {_METADATA_COMPRESSION_PROPERTY: "gzip"}
-    elif compression == "none":
-        table_properties = {}
-    else:
-        raise ValueError(
-            "Unsupported Iceberg metadata compression codec "
-            f"'{iceberg_metadata_compression}'. Expected 'gzip' or 'none'."
-        )
-    return parquet_batch_size, iceberg_upload_chunk_bytes, table_properties
+    return parquet_batch_size, iceberg_upload_chunk_bytes, iceberg_table_properties or {}
 
 
-def reconcile_iceberg_metadata_compression(
-    table: IcebergTable, table_properties: Optional[Dict[str, str]]
+def reconcile_iceberg_table_properties(
+    table: IcebergTable, table_properties: Dict[str, str]
 ) -> None:
-    """Apply an explicitly configured metadata compression setting to an existing table."""
-    if table_properties is None:
-        return
+    """Apply configured table properties to an existing table, reconciling any differences.
 
-    configured = table_properties.get(_METADATA_COMPRESSION_PROPERTY)
-    current = table.properties.get(_METADATA_COMPRESSION_PROPERTY)
-    if configured == current:
+    Only properties whose configured value differs from the current table value are updated.
+    This ensures existing tables pick up property changes (e.g. changing compression codec)
+    without requiring a table recreation.
+    """
+    to_set = {k: v for k, v in table_properties.items() if table.properties.get(k) != v}
+    if not to_set:
         return
-
     with table.transaction() as transaction:
-        if configured:
-            transaction.set_properties({_METADATA_COMPRESSION_PROPERTY: configured})
-        elif current:
-            transaction.remove_properties(_METADATA_COMPRESSION_PROPERTY)
+        transaction.set_properties(to_set)
 
 
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")

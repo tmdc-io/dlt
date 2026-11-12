@@ -237,7 +237,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             merge_iceberg_table,
             create_table,
             get_iceberg_config_tuning,
-            reconcile_iceberg_metadata_compression,
+            reconcile_iceberg_table_properties,
         )
         from dlt.destinations.impl.filesystem.iceberg_partition_spec import (
             build_iceberg_partition_spec,
@@ -288,7 +288,7 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             self.run()
             return
 
-        reconcile_iceberg_metadata_compression(table, table_properties)
+        reconcile_iceberg_table_properties(table, table_properties)
 
         write_disposition = self._load_table["write_disposition"]
         arrow_rbr = pa.RecordBatchReader.from_batches(
