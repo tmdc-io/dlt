@@ -208,7 +208,7 @@ def write_iceberg_table(
     )
 
     if isinstance(data, pa.RecordBatchReader):
-        _, upload_chunk_bytes, __ = get_iceberg_config_tuning()
+        _, upload_chunk_bytes = get_iceberg_config_tuning()
         _write_iceberg_table_streamed(table, data, write_disposition, upload_chunk_bytes)
     else:
         if write_disposition == "append":
@@ -378,7 +378,7 @@ def merge_iceberg_table(
         else:
             join_cols = get_columns_names_with_prop(schema, "primary_key")
 
-        _, upload_chunk_bytes, __ = get_iceberg_config_tuning()
+        _, upload_chunk_bytes = get_iceberg_config_tuning()
         _upsert_iceberg_table(
             table,
             data,
@@ -612,18 +612,6 @@ class IcebergConfig(BaseConfiguration):
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES
     """Bytes per read when uploading a parquet file to remote storage (default 8 MB)."""
 
-    iceberg_table_properties: Optional[Dict[str, str]] = None
-    """Iceberg table properties applied to new and existing tables. Values must be strings.
-
-    Set via env var (JSON string):
-        ICEBERG_CATALOG__ICEBERG_TABLE_PROPERTIES='{"write.metadata.compression-codec": "gzip"}'
-
-    Or in secrets.toml:
-        [iceberg_catalog]
-        [iceberg_catalog.iceberg_table_properties]
-        "write.metadata.compression-codec" = "gzip"
-    """
-
 
 def _load_catalog_from_pyiceberg(
     catalog_name: str,
@@ -750,15 +738,14 @@ def _get_writer_config(
 @with_config(spec=IcebergConfig, sections="iceberg_catalog")
 def get_iceberg_config_tuning(
     iceberg_upload_chunk_bytes: int = _UPLOAD_CHUNK_BYTES,
-    iceberg_table_properties: Optional[Dict[str, str]] = None,
-) -> Tuple[int, int, Dict[str, str]]:
-    """Return (parquet_batch_size, upload_chunk_bytes, iceberg_table_properties) resolved from dlt config / env vars.
+) -> Tuple[int, int]:
+    """Return (parquet_batch_size, upload_chunk_bytes) resolved from dlt config / env vars.
 
     Arrow batch size equals file_max_items (LOADER_FILE_SIZE) so that each
     intermediate file is read as one batch: 1 file = 1 batch.
     """
     parquet_batch_size = _get_writer_config() or 50_000
-    return parquet_batch_size, iceberg_upload_chunk_bytes, iceberg_table_properties or {}
+    return parquet_batch_size, iceberg_upload_chunk_bytes
 
 
 def reconcile_iceberg_table_properties(

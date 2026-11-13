@@ -51,7 +51,24 @@ class FilesystemDestinationClientConfiguration(FilesystemConfigurationWithLocalF
         Pass the dict directly in Python or via a dlt secrets/config file instead.
     """
 
-    __config_gen_annotations__: ClassVar[List[str]] = ["iceberg_spark_config"]
+    iceberg_table_properties: Optional[Dict[str, str]] = None
+    """Iceberg table properties. Values must be strings.
+
+    Example::
+
+        destination.filesystem(
+            iceberg_table_properties={
+                "write.metadata.compression-codec": "gzip",
+                "write.target-file-size-bytes": "536870912",
+            }
+        )
+
+    .. note::
+        This field is a plain ``Dict`` and cannot be populated via nested ``__`` env vars.
+        Pass the dict directly in Python or via a dlt secrets/config file instead.
+    """
+
+    __config_gen_annotations__: ClassVar[List[str]] = ["iceberg_spark_config", "iceberg_table_properties"]
 
     @resolve_type("credentials")
     def resolve_credentials_type(self) -> Type[CredentialsConfiguration]:

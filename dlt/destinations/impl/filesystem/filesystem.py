@@ -250,7 +250,8 @@ class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):
             f" {self.make_remote_url()} [arrow buffer: {pa.total_allocated_bytes()}]"
         )
 
-        parquet_batch_size, _, table_properties = get_iceberg_config_tuning()
+        parquet_batch_size, _ = get_iceberg_config_tuning()
+        table_properties = self._job_client.config.iceberg_table_properties or {}
 
         try:
             table = self._job_client.load_open_table(
