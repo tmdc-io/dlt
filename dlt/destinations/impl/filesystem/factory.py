@@ -94,6 +94,7 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
         current_datetime: Optional[TCurrentDateTime] = None,
         always_refresh_views: bool = None,
         state_bucket_url: str = None,
+        iceberg_table_properties: Optional[Dict[str, str]] = None,
         destination_name: str = None,
         environment: str = None,
         **kwargs: Any,
@@ -123,6 +124,7 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
                 will be used.
             always_refresh_views (bool, optional): Always refresh sql_client views by setting the newest table metadata or globbing table files
             state_bucket_url (str, optional): If set, dlt internal tables (_dlt_*) are written here instead of bucket_url.
+            iceberg_table_properties (Optional[Dict[str, str]], optional): Iceberg table properties. Values must be strings.
             destination_name (str, optional): Name of the destination, can be used in config section to differentiate between multiple of the same type
             environment (str, optional): Environment of the destination
             **kwargs (Any): Additional arguments passed to the destination config
@@ -136,6 +138,7 @@ class filesystem(Destination[FilesystemDestinationClientConfiguration, "Filesyst
             current_datetime=current_datetime,
             always_refresh_views=always_refresh_views,
             state_bucket_url=state_bucket_url,
+            iceberg_table_properties=iceberg_table_properties,
             destination_name=destination_name,
             environment=environment,
             **kwargs,
