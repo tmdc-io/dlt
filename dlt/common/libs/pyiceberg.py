@@ -207,7 +207,13 @@ def write_iceberg_table(
         f" table={table.name()} disposition={write_disposition} mode={mode}"
     )
 
-    if isinstance(data, pa.RecordBatchReader):
+    if TableProperties.WRITE_TARGET_FILE_SIZE_BYTES in table.properties:
+        from dlt.common.libs.iceberg_rolling import write_sized_files
+
+        _, upload_chunk_bytes = get_iceberg_config_tuning()
+        batches = data if isinstance(data, pa.RecordBatchReader) else data.to_batches()
+        write_sized_files(table, batches, write_disposition, upload_chunk_bytes)
+    elif isinstance(data, pa.RecordBatchReader):
         _, upload_chunk_bytes = get_iceberg_config_tuning()
         _write_iceberg_table_streamed(table, data, write_disposition, upload_chunk_bytes)
     else:
@@ -460,6 +466,9 @@ def _upsert_iceberg_table(
     start_ts = precise_time()
     is_partitioned = table.spec() != UNPARTITIONED_PARTITION_SPEC
     total_updated = 0
+    sized = TableProperties.WRITE_TARGET_FILE_SIZE_BYTES in table.properties
+    if sized:
+        from dlt.common.libs.iceberg_rolling import write_sized_files
     total_inserted = 0
     batch_count = 0
 
@@ -481,14 +490,21 @@ def _upsert_iceberg_table(
         # Txn 1: overwrite matched rows (never combined with append/add_files)
         if rows_to_update is not None:
             overwrite_filter = upsert_util.create_match_filter(rows_to_update, join_cols)
-            with table.transaction() as txn:
-                txn.overwrite(rows_to_update, overwrite_filter=overwrite_filter)
+            if sized:
+                write_sized_files(
+                    table, rows_to_update.to_batches(), "merge", upload_chunk_bytes, overwrite_filter
+                )
+            else:
+                with table.transaction() as txn:
+                    txn.overwrite(rows_to_update, overwrite_filter=overwrite_filter)
             total_updated += len(rows_to_update)
 
         # Txn 2: insert new rows (separate transaction, safe for both partitioned and not)
         if len(rows_to_insert) > 0:
             total_inserted += len(rows_to_insert)
-            if is_partitioned:
+            if sized:
+                write_sized_files(table, rows_to_insert.to_batches(), "append", upload_chunk_bytes)
+            elif is_partitioned:
                 with table.transaction() as txn:
                     txn.append(rows_to_insert)
             else:
