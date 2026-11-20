@@ -1,5 +1,7 @@
 """Roll Iceberg data files using the encoded Parquet stream position."""
+import os
 from collections import OrderedDict
+from pathlib import Path
 from shutil import copyfileobj
 from tempfile import TemporaryFile
 from uuid import uuid4
@@ -20,10 +22,23 @@ from dlt.common.libs.pyiceberg import _delete_files, ensure_iceberg_compatible_a
 from dlt.common.schema.typing import TWriteDisposition
 
 
+def _resolve_tmpdir():
+    """Resolve the directory for temporary Parquet staging files."""
+    persistent_dir = os.environ.get("DATAOS_PERSISTENT_DIR")
+    if persistent_dir:
+        return str(Path(persistent_dir) / "iceberg_staging")
+    work_dir = os.environ.get("DATAOS_WORK_DIR")
+    if work_dir:
+        return str(Path(work_dir) / "iceberg_staging")
+    return None
+
+
 class _OpenFile:
-    def __init__(self, key, schema, options):
+    def __init__(self, key, schema, options, tmpdir) -> None:
         self.key = key
-        self.stream = TemporaryFile()
+        if tmpdir is not None:
+            os.makedirs(tmpdir, exist_ok=True)
+        self.stream = TemporaryFile(dir=tmpdir)
         try:
             self.writer = pq.ParquetWriter(self.stream, schema, **options)
         except BaseException:
@@ -93,6 +108,7 @@ def write_sized_files(
     stats_plan = iceberg_arrow.compute_statistics_plan(file_schema, props)
     column_ids = iceberg_arrow.parquet_path_to_id_mapping(file_schema)
     downcast = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+    tmpdir = _resolve_tmpdir()
     open_files = OrderedDict()
     uploaded = []
     files = []
@@ -148,7 +164,7 @@ def write_sized_files(
                     if partition not in open_files:
                         if len(open_files) == 32:
                             finish(open_files.popitem(last=False)[1])
-                        open_files[partition] = _OpenFile(key, projected.schema, options)
+                        open_files[partition] = _OpenFile(key, projected.schema, options, tmpdir)
                     current = open_files[partition]
                     open_files.move_to_end(partition)
                     offset += current.write_group(projected, offset, target, row_limit)
